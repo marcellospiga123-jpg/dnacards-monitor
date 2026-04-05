@@ -1,13 +1,9 @@
 import json
 import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-
 import requests
 from bs4 import BeautifulSoup
 
-# ─── URL ─────────────────────────────────────────────────────────────
+# ─── CONFIG ─────────────────────────────────────────
 
 URLS = [
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
@@ -15,208 +11,150 @@ URLS = [
     "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
 ]
 
-# ─── EMAIL ───────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-EMAIL_ATTIVA       = True
-EMAIL_MITTENTE     = os.environ.get("EMAIL_MITTENTE", "")
-EMAIL_PASSWORD     = os.environ.get("EMAIL_PASSWORD", "")
-EMAIL_DESTINATARIO = os.environ.get("EMAIL_DESTINATARIO", "")
+GIST_TOKEN = os.environ.get("GIST_TOKEN")
+GIST_ID = os.environ.get("GIST_ID")
+GIST_FILE = "dnacards_stato.json"
 
-# ─── TELEGRAM ────────────────────────────────────────────────────────
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# ─── TELEGRAM ───────────────────────────────────────
 
-# ─── GIST ────────────────────────────────────────────────────────────
+def invia_telegram(variazioni):
+    for v in variazioni:
+        testo = f"🔔 *{v['tipo'].upper()}*\n\n"
+        testo += f"📦 {v['nome']}\n"
+        testo += f"💰 {v.get('prezzo', v.get('prezzo_nuovo', 'N/D'))}\n"
 
-GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
-GIST_ID    = os.environ.get("GIST_ID", "")
-GIST_FILE  = "dnacards_stato.json"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": testo,
+            "parse_mode": "Markdown",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {
+                        "text": "🔗 Apri prodotto",
+                        "url": v["link"]
+                    }
+                ]]
+            }
+        }
 
-# ─── STATO ───────────────────────────────────────────────────────────
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json=payload
+        )
+
+# ─── GIST ───────────────────────────────────────────
 
 def carica_stato():
-    if not GIST_ID or not GIST_TOKEN:
+    if not GIST_ID:
         return {}
-    try:
-        r = requests.get(
-            f"https://api.github.com/gists/{GIST_ID}",
-            headers={"Authorization": f"token {GIST_TOKEN}"},
-        )
-        if r.ok:
-            content = r.json()["files"].get(GIST_FILE, {}).get("content", "{}")
-            return json.loads(content)
-    except:
-        pass
+    r = requests.get(
+        f"https://api.github.com/gists/{GIST_ID}",
+        headers={"Authorization": f"token {GIST_TOKEN}"}
+    )
+    if r.ok:
+        content = r.json()["files"].get(GIST_FILE, {}).get("content", "{}")
+        return json.loads(content)
     return {}
 
 def salva_stato(prodotti):
-    if not GIST_ID or not GIST_TOKEN:
-        return
-    stato = {p["nome"]: {"prezzo": p["prezzo"], "disponibile": p["disponibile"]} for p in prodotti}
+    stato = {p["nome"]: p for p in prodotti}
     requests.patch(
         f"https://api.github.com/gists/{GIST_ID}",
         headers={"Authorization": f"token {GIST_TOKEN}"},
-        json={"files": {GIST_FILE: {"content": json.dumps(stato, indent=2)}}},
+        json={
+            "files": {
+                GIST_FILE: {
+                    "content": json.dumps(stato, indent=2, ensure_ascii=False)
+                }
+            }
+        }
     )
 
-# ─── SCRAPING VELOCE ────────────────────────────────────────────────
+# ─── SCRAPER ────────────────────────────────────────
 
 def scrape():
     prodotti = []
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    for URL in URLS:
+        print(f"Controllo: {URL}")
 
-    for url in URLS:
-        print(f"Controllo: {url}")
-
-        r = requests.get(url, headers=headers, timeout=20)
+        r = requests.get(URL, headers=HEADERS)
         soup = BeautifulSoup(r.text, "html.parser")
 
         cards = soup.select("li.product")
 
-        for card in cards:
-            try:
-                nome = card.select_one(".woocommerce-loop-product__title")
-                nome = nome.text.strip() if nome else "N/D"
+        for c in cards:
+            nome = c.select_one(".woocommerce-loop-product__title")
+            nome = nome.text.strip() if nome else "N/D"
 
-                prezzo = card.select_one(".price .amount")
-                prezzo = prezzo.text.strip() if prezzo else "N/D"
+            prezzo = c.select_one(".price")
+            prezzo = prezzo.text.strip() if prezzo else "N/D"
 
-                disponibile = not card.select_one(".out-of-stock")
+            link = c.select_one("a")
+            link = link["href"] if link else URL
 
-                link = card.select_one("a")["href"]
+            disponibile = not c.select_one(".out-of-stock")
 
-                prodotti.append({
-                    "nome": nome,
-                    "prezzo": prezzo,
-                    "disponibile": disponibile,
-                    "link": link
-                })
-            except:
-                pass
+            prodotti.append({
+                "nome": nome,
+                "prezzo": prezzo,
+                "disponibile": disponibile,
+                "link": link
+            })
 
     return prodotti
 
-# ─── CONFRONTO ──────────────────────────────────────────────────────
+# ─── CONFRONTO ──────────────────────────────────────
 
 def confronta(nuovi, vecchi):
     variazioni = []
 
     for p in nuovi:
         nome = p["nome"]
-        old = vecchi.get(nome)
+        v = vecchi.get(nome)
 
-        if not old:
-            variazioni.append({"tipo": "nuovo", **p})
+        if not v:
+            variazioni.append({**p, "tipo": "nuovo"})
             continue
 
-        if old["prezzo"] != p["prezzo"]:
+        if v["prezzo"] != p["prezzo"]:
             variazioni.append({
+                **p,
                 "tipo": "prezzo",
-                "nome": nome,
-                "vecchio": old["prezzo"],
-                "nuovo": p["prezzo"],
-                "link": p["link"]
+                "prezzo_vecchio": v["prezzo"],
+                "prezzo_nuovo": p["prezzo"]
             })
 
-        if old["disponibile"] != p["disponibile"]:
-            variazioni.append({
-                "tipo": "stock",
-                "nome": nome,
-                "disponibile": p["disponibile"],
-                "link": p["link"]
-            })
+        if v["disponibile"] != p["disponibile"]:
+            tipo = "disponibile" if p["disponibile"] else "esaurito"
+            variazioni.append({**p, "tipo": tipo})
 
     return variazioni
 
-# ─── FORMAT (BONUS BELLO 🔥) ─────────────────────────────────────────
-
-def formatta(variazioni):
-    testo = "🔔 DNA Cards Alert\n\n"
-
-    for v in variazioni:
-        if v["tipo"] == "prezzo":
-            testo += f"💰 PREZZO: {v['nome']}\n"
-            testo += f"{v['vecchio']} → {v['nuovo']}\n"
-            testo += f"{v['link']}\n\n"
-
-        elif v["tipo"] == "stock":
-            stato = "✅ Disponibile" if v["disponibile"] else "❌ Esaurito"
-            testo += f"📦 STOCK: {v['nome']}\n"
-            testo += f"{stato}\n"
-            testo += f"{v['link']}\n\n"
-
-        elif v["tipo"] == "nuovo":
-            testo += f"🆕 NUOVO: {v['nome']}\n"
-            testo += f"{v.get('prezzo', 'N/D')}\n"
-            testo += f"{v['link']}\n\n"
-
-    return testo
-
-# ─── EMAIL ──────────────────────────────────────────────────────────
-
-def invia_email(testo):
-    try:
-        msg = MIMEMultipart()
-        msg["Subject"] = "DNA Cards Update"
-        msg["From"] = EMAIL_MITTENTE
-        msg["To"] = EMAIL_DESTINATARIO
-
-        msg.attach(MIMEText(testo, "plain"))
-
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login(EMAIL_MITTENTE, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_MITTENTE, EMAIL_DESTINATARIO, msg.as_string())
-
-        print("Email inviata")
-    except Exception as e:
-        print("Errore email:", e)
-
-# ─── TELEGRAM ───────────────────────────────────────────────────────
-
-def invia_telegram(testo):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": testo,
-                "parse_mode": "HTML"
-            },
-            timeout=10
-        )
-        print("Telegram inviato")
-    except Exception as e:
-        print("Errore telegram:", e)
-
-# ─── MAIN ───────────────────────────────────────────────────────────
+# ─── MAIN ───────────────────────────────────────────
 
 def main():
-    print("Controllo...")
+    print("Monitor avviato...")
 
-    prodotti = scrape()
-    stato = carica_stato()
+    nuovi = scrape()
+    vecchi = carica_stato()
 
-    if not stato:
-        salva_stato(prodotti)
-        print("Primo avvio")
+    if not vecchi:
+        print("Primo avvio → salvo stato")
+        salva_stato(nuovi)
         return
 
-    var = confronta(prodotti, stato)
+    variazioni = confronta(nuovi, vecchi)
 
-    if var:
-        msg = formatta(var)
-        print(msg)
-        invia_email(msg)
-        invia_telegram(msg)
-        salva_stato(prodotti)
+    if variazioni:
+        print("⚠️ Cambiamenti trovati!")
+        invia_telegram(variazioni)
+        salva_stato(nuovi)
     else:
         print("Nessuna variazione")
 
