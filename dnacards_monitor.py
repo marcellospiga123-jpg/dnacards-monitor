@@ -1,4 +1,4 @@
-"""
+X"""
 L
 DNA Cards - Monitor prezzi e disponibilità
 Versione GitHub Actions — gira una volta sola, stato salvato su GitHub Gist
@@ -70,7 +70,7 @@ def scrape_prodotti():
     headless=True,
     args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
 )
-        )
+        
         page = browser.new_page()
         page.set_extra_http_headers({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
