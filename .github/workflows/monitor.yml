@@ -8,8 +8,10 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/setup-python@v5
+      - name: Clona repository
+        uses: actions/checkout@v4   # 🔥 FONDAMENTALE
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -19,8 +21,10 @@ jobs:
       - name: Installa dipendenze
         run: |
           pip install playwright requests
-          playwright install chromium
-          playwright install-deps chromium
+          playwright install --with-deps
+
+      - name: Debug (opzionale ma utile)
+        run: ls -R
 
       - name: Esegui monitor
         env:
