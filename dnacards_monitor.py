@@ -1,6 +1,7 @@
 """
-DNA Cards - Monitor prezzi e disponibilità
-Versione FAST (senza Playwright)
+DNA Cards Monitor PRO
+Monitora EN + JP + Bustine singole
+Versione veloce (no Playwright)
 """
 
 import json
@@ -12,24 +13,30 @@ from email.mime.text import MIMEText
 import requests
 from bs4 import BeautifulSoup
 
-# ─── CONFIG ─────────────────────────────────────────
+# ─── URL MULTIPLI ───────────────────────────────────
 
-URL = "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/"
+URLS = [
+    "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
+    "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
+    "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
+]
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# ─── EMAIL ─────────────────────────────────────────
 
 EMAIL_ATTIVA = True
 EMAIL_MITTENTE = os.environ.get("EMAIL_MITTENTE", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_DESTINATARIO = os.environ.get("EMAIL_DESTINATARIO", "")
 
+# ─── GIST ───────────────────────────────────────────
+
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
 GIST_ID = os.environ.get("GIST_ID", "")
 GIST_FILE = "dnacards_stato.json"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
-
-# ─── GIST ───────────────────────────────────────────
+# ─── GIST FUNZIONI ──────────────────────────────────
 
 def carica_stato():
     if not GIST_ID or not GIST_TOKEN:
@@ -74,47 +81,52 @@ def salva_stato(prodotti):
     except Exception as e:
         print(f"[!] Errore salvataggio stato: {e}")
 
-# ─── SCRAPING FAST ──────────────────────────────────
+# ─── SCRAPING MULTI PAGINA ──────────────────────────
 
 def scrape_prodotti():
-    try:
-        r = requests.get(URL, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[!] Errore richiesta: {e}")
-        return []
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
     prodotti = []
-    cards = soup.select("li.product")
 
-    print(f"Trovati {len(cards)} prodotti")
+    for url in URLS:
+        print(f"\n🔎 Controllo: {url}")
 
-    for card in cards:
         try:
-            nome_el = card.select_one(".woocommerce-loop-product__title")
-            nome = nome_el.text.strip() if nome_el else "N/D"
-
-            prezzo_el = card.select_one("ins .amount") or card.select_one(".price .amount")
-            prezzo = prezzo_el.text.strip() if prezzo_el else None
-
-            # stock
-            out = card.select_one(".out-of-stock, .soldout, .button.disabled")
-            disponibile = not bool(out)
-
-            link_el = card.select_one("a")
-            link = link_el["href"] if link_el else URL
-
-            prodotti.append({
-                "nome": nome,
-                "prezzo": prezzo,
-                "disponibile": disponibile,
-                "link": link,
-            })
-
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
         except Exception as e:
-            print(f"[!] Errore prodotto: {e}")
+            print(f"[!] Errore richiesta: {e}")
+            continue
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        cards = soup.select("li.product")
+
+        print(f"Trovati {len(cards)} prodotti")
+
+        for card in cards:
+            try:
+                nome_el = card.select_one(".woocommerce-loop-product__title")
+                nome = nome_el.text.strip() if nome_el else "N/D"
+
+                # aggiungo tag pagina per distinguere
+                nome = f"[{url.split('/')[-2]}] {nome}"
+
+                prezzo_el = card.select_one("ins .amount") or card.select_one(".price .amount")
+                prezzo = prezzo_el.text.strip() if prezzo_el else None
+
+                out = card.select_one(".out-of-stock, .soldout, .button.disabled")
+                disponibile = not bool(out)
+
+                link_el = card.select_one("a")
+                link = link_el["href"] if link_el else url
+
+                prodotti.append({
+                    "nome": nome,
+                    "prezzo": prezzo,
+                    "disponibile": disponibile,
+                    "link": link,
+                })
+
+            except Exception as e:
+                print(f"[!] Errore prodotto: {e}")
 
     return prodotti
 
@@ -174,7 +186,7 @@ def invia_email(testo):
 # ─── MAIN ───────────────────────────────────────────
 
 def main():
-    print("🚀 Monitor veloce avviato...\n")
+    print("🚀 Monitor PRO avviato...\n")
 
     prodotti = scrape_prodotti()
 
