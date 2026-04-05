@@ -51,7 +51,7 @@ def send_photo(path, log):
     r = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
         files={"photo": open(path, "rb")},
-        data={"chat_id": TELEGRAM_CHAT_ID}
+        data={"chat_id": TELEGRAM_CHATGRAM_CHAT_ID}
     ).json()
 
     try:
@@ -137,7 +137,7 @@ def update(storico, prodotti):
 
     return storico
 
-# ─── AI ─────────────────────────────────
+# ─── AI PREVISIONE ──────────────────────
 
 def predict_price(valori):
     if len(valori) < 5:
@@ -147,6 +147,8 @@ def predict_price(valori):
     slope = trend / len(valori)
 
     return round(valori[-1] + slope * 5, 2)
+
+# ─── EBAY ───────────────────────────────
 
 def get_ebay_price(nome):
     try:
@@ -193,18 +195,19 @@ def check_stock(prodotti, old_stock, log):
 
         if old != disponibile:
             if disponibile:
-                send_msg(f"✅ DISPONIBILE\n{nome}", log)
+                send_msg(f"✅ TORNATO DISPONIBILE\n\n{nome}", log)
             else:
-                send_msg(f"❌ ESAURITO\n{nome}", log)
+                send_msg(f"❌ ESAURITO\n\n{nome}", log)
 
     return new_stock
 
-# ─── ANALISI ────────────────────────────
+# ─── ANALISI COMPLETA ───────────────────
 
 def analisi(prodotti, storico, alerts, log):
     segnali = []
 
     for nome, varianti in prodotti.items():
+        is_watch = any(w in nome for w in WATCHLIST)
 
         prezzi = [(p_float(v["prezzo"]), v) for v in varianti if p_float(v["prezzo"])]
         if not prezzi:
@@ -218,23 +221,46 @@ def analisi(prodotti, storico, alerts, log):
         if len(valori) < 5:
             continue
 
-        avg = sum(valori)/len(valori)
-        pred = predict_price(valori)
-        ebay = get_ebay_price(nome)
+        avg = sum(valori) / len(valori)
+        max_p = max(valori)
 
-        profit = (pred or avg) - best_price
-        roi = profit / best_price if best_price else 0
+        pred = predict_price(valori)
+        ebay_price = get_ebay_price(nome)
+
+        profitto = (pred or max_p) - best_price
+        roi = profitto / best_price if best_price else 0
 
         score = 0
-        if best_price < avg: score += 30
-        if roi > ROI_MIN: score += 30
-        if ebay and best_price < ebay: score += 20
+        if best_price < avg: score += 25
+        if roi > ROI_MIN: score += 25
+        if pred and pred > avg: score += 15
+        if is_watch: score += 15
+        if ebay_price and best_price < ebay_price: score += 20
 
-        if profit > PROFIT_MIN and score > CONFIDENCE_MIN:
-            if nome not in alerts:
-                msg = f"🚨 TRADE\n{nome}\n💰 {best_price}€\n📈 ROI {round(roi*100,1)}%\n🌐 eBay {ebay}"
+        # TARGET ALERT
+        if best_price < TARGET_PRICE:
+            send_msg(f"🎯 TARGET HIT\n{nome}\n💰 {best_price}€\n{best['link']}", log)
+
+        if profitto >= PROFIT_MIN and score >= CONFIDENCE_MIN:
+            key = f"Q_{nome}"
+
+            if key not in alerts:
+                qty = int(100 / best_price) if best_price else 1
+
+                msg = (
+                    f"🚨 AI TRADE\n\n"
+                    f"{nome}\n\n"
+                    f"💰 Prezzo: {best_price}€ ({best['sito']})\n"
+                    f"🌐 eBay: {ebay_price}€\n"
+                    f"🔮 Predizione: {pred}€\n"
+                    f"📈 ROI: {round(roi*100,1)}%\n"
+                    f"⚡ Score: {score}/100\n\n"
+                    f"🧠 Compra ~{qty} → Profitto stimato: {round(qty*profitto,2)}€\n\n"
+                    f"{best['link']}"
+                )
+
                 segnali.append(msg)
-                alerts[nome] = True
+                alerts[key] = True
 
     return segnali
 
@@ -246,37 +272,72 @@ def grafico(storico):
     for nome, dati in list(storico.items())[:5]:
         prezzi = [p_float(d["p"]) for d in dati if p_float(d["p"])]
         if len(prezzi) > 1:
-            plt.plot(prezzi, label=nome[:10])
+            plt.plot(prezzi, label=nome[:12])
+
+    if not plt.gca().has_data():
+        return None
 
     plt.legend()
     file = "grafico.png"
     plt.savefig(file)
     plt.close()
+
     return file
+
+# ─── HEARTBEAT ──────────────────────────
+
+def heartbeat(log):
+    data = load(HEARTBEAT_FILE)
+    now = datetime.now().timestamp()
+
+    if now - data.get("last", 0) > HEARTBEAT_HOURS * 3600:
+        send_msg("🤖 AI TRADER ONLINE", log)
+        data["last"] = now
+        save(HEARTBEAT_FILE, data)
+
+# ─── CLEAN ──────────────────────────────
+
+def clean_messages(log):
+    now = datetime.now().timestamp()
+    keep = []
+
+    for m in log:
+        if now - m["time"] > 86400:
+            delete_msg(m["id"])
+        else:
+            keep.append(m)
+
+    return keep
 
 # ─── MAIN ───────────────────────────────
 
 def main():
     storico = load(STORICO_FILE)
     alerts = load(ALERT_FILE)
-    stock_old = load(STOCK_FILE)
+    old_stock = load(STOCK_FILE)
     log = load(MSG_FILE)
 
     prodotti = scrape()
     storico = update(storico, prodotti)
 
-    stock_new = check_stock(prodotti, stock_old, log)
+    new_stock = check_stock(prodotti, old_stock, log)
+
     segnali = analisi(prodotti, storico, alerts, log)
 
     for s in segnali:
         send_msg(s, log)
 
     if segnali:
-        send_photo(grafico(storico), log)
+        g = grafico(storico)
+        if g:
+            send_photo(g, log)
+
+    heartbeat(log)
+    log = clean_messages(log)
 
     save(STORICO_FILE, storico)
     save(ALERT_FILE, alerts)
-    save(STOCK_FILE, stock_new)
+    save(STOCK_FILE, new_stock)
     save(MSG_FILE, log)
 
 if __name__ == "__main__":
