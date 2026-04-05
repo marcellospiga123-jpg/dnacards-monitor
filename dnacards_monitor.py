@@ -1,116 +1,110 @@
 import requests
-from bs4 import BeautifulSoup
 import json
 import time
-import os
 import base64
+import os
 
-# ===== CONFIG =====
+# ==============================
+# CONFIG (usa Secrets GitHub)
+# ==============================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-GITHUB_TOKEN = os.getenv("GH_TOKEN")
 REPO = "marcellospiga123-jpg/dna-dashboard"
 FILE_PATH = "storico.json"
 
-# ===== TELEGRAM =====
+# ==============================
+# TELEGRAM (CON DEBUG)
+# ==============================
 def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+    
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-    except:
-        print("Errore Telegram")
+        r = requests.post(url, data=data)
+        print("TELEGRAM RESPONSE:", r.text)
+    except Exception as e:
+        print("ERRORE TELEGRAM:", e)
 
-# ===== GITHUB LOAD =====
+# ==============================
+# GITHUB LOAD SICURO
+# ==============================
 def load_github():
     url = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+
     r = requests.get(url, headers=headers)
 
     if r.status_code == 200:
         data = r.json()
+
+        # 🔥 FIX ERRORE content
+        if "content" not in data:
+            print("File vuoto o formato errato")
+            return [], None
+
         content = base64.b64decode(data["content"]).decode()
         return json.loads(content), data["sha"]
-    else:
-        return {}, None
 
-# ===== GITHUB SAVE =====
+    else:
+        print("File non trovato, ne creo uno nuovo")
+        return [], None
+
+# ==============================
+# GITHUB SAVE
+# ==============================
 def save_github(data, sha):
     url = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
     content = base64.b64encode(json.dumps(data, indent=2).encode()).decode()
 
-    payload = {
-        "message": "update prezzi",
+    body = {
+        "message": "update storico",
         "content": content,
         "sha": sha
     }
 
-    requests.put(url, headers=headers, json=payload)
+    requests.put(url, headers=headers, json=body)
 
-# ===== SCRAPER =====
-def get_products():
-    url = "https://www.dnacards.it/collections/one-piece"
-    r = requests.get(url)
-    soup = BeautifulSoup(r.text, "html.parser")
+# ==============================
+# DATI FAKE (SIMULAZIONE)
+# ==============================
+def get_data():
+    # Simula prezzi
+    return [
+        {"name": "Carta A", "price": 10 + int(time.time()) % 5},
+        {"name": "Carta B", "price": 20 + int(time.time()) % 3},
+    ]
 
-    prodotti = []
-
-    for item in soup.select(".grid-product"):
-        nome = item.select_one(".grid-product__title").text.strip()
-        
-        prezzo = item.select_one(".grid-product__price").text.strip()
-        prezzo = float(prezzo.replace("€", "").replace(",", "."))
-
-        # CHECK ESAURITO
-        disponibile = True
-        if "Sold out" in item.text or "Esaurito" in item.text:
-            disponibile = False
-
-        prodotti.append({
-            "nome": nome,
-            "prezzo": prezzo,
-            "disponibile": disponibile
-        })
-
-    return prodotti
-
-# ===== MAIN =====
+# ==============================
+# MAIN
+# ==============================
 def main():
+    # 🔥 TEST TELEGRAM
+    send_telegram("🚀 BOT AVVIATO CORRETTAMENTE")
+
     storico, sha = load_github()
+    nuovi_dati = get_data()
 
-    prodotti = get_products()
+    alert = False
 
-    for p in prodotti:
-        nome = p["nome"]
-        prezzo = p["prezzo"]
-        disponibile = p["disponibile"]
+    for item in nuovi_dati:
+        for old in storico:
+            if item["name"] == old["name"]:
+                if item["price"] > old["price"]:
+                    msg = f"📈 {item['name']} salita!\n{old['price']} → {item['price']}"
+                    send_telegram(msg)
+                    alert = True
 
-        if nome not in storico:
-            storico[nome] = {
-                "prezzo": prezzo,
-                "disponibile": disponibile
-            }
-            continue
+    save_github(nuovi_dati, sha)
 
-        # 🔥 CAMBIO PREZZO
-        if prezzo != storico[nome]["prezzo"]:
-            send_telegram(f"💰 PREZZO CAMBIATO\n{nome}\n{prezzo}€")
+    if not alert:
+        print("Nessun cambiamento")
 
-        # 🔥 ESAURITO
-        if storico[nome]["disponibile"] and not disponibile:
-            send_telegram(f"❌ ESAURITO\n{nome}")
-
-        # 🔥 TORNATO DISPONIBILE
-        if not storico[nome]["disponibile"] and disponibile:
-            send_telegram(f"✅ DISPONIBILE DI NUOVO\n{nome}")
-
-        storico[nome]["prezzo"] = prezzo
-        storico[nome]["disponibile"] = disponibile
-
-    save_github(storico, sha)
-
-# LOOP
+# ==============================
+# START
+# ==============================
 if __name__ == "__main__":
     main()
