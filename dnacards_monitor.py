@@ -2,14 +2,16 @@ import json
 import os
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime
+import matplotlib.pyplot as plt
 
 # ─── CONFIG ─────────────────────────────────────────
 
-URLS = [
-    "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
-    "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
-    "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
-]
+URLS = {
+    "EN Display": "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
+    "JP Display": "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
+    "EN Singole": "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
+}
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -22,141 +24,184 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ─── TELEGRAM ───────────────────────────────────────
 
-def invia_telegram(variazioni):
-    for v in variazioni:
-        testo = f"🔔 *{v['tipo'].upper()}*\n\n"
-        testo += f"📦 {v['nome']}\n"
-        testo += f"💰 {v.get('prezzo', v.get('prezzo_nuovo', 'N/D'))}\n"
+def invia_telegram(testo, link=None):
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": testo,
+        "parse_mode": "Markdown"
+    }
 
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": testo,
-            "parse_mode": "Markdown",
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {
-                        "text": "🔗 Apri prodotto",
-                        "url": v["link"]
-                    }
-                ]]
-            }
+    if link:
+        payload["reply_markup"] = {
+            "inline_keyboard": [[
+                {"text": "🔗 Apri prodotto", "url": link}
+            ]]
         }
 
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        json=payload
+    )
+
+def invia_foto(file_path):
+    with open(file_path, "rb") as f:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json=payload
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+            data={"chat_id": TELEGRAM_CHAT_ID},
+            files={"photo": f}
         )
 
-# ─── GIST ───────────────────────────────────────────
+# ─── GRAFICO ────────────────────────────────────────
 
-def carica_stato():
-    if not GIST_ID:
-        return {}
-    r = requests.get(
-        f"https://api.github.com/gists/{GIST_ID}",
-        headers={"Authorization": f"token {GIST_TOKEN}"}
-    )
-    if r.ok:
-        content = r.json()["files"].get(GIST_FILE, {}).get("content", "{}")
-        return json.loads(content)
-    return {}
+def genera_grafico(nome, storico):
+    prezzi, date = [], []
 
-def salva_stato(prodotti):
-    stato = {p["nome"]: p for p in prodotti}
-    requests.patch(
-        f"https://api.github.com/gists/{GIST_ID}",
-        headers={"Authorization": f"token {GIST_TOKEN}"},
-        json={
-            "files": {
-                GIST_FILE: {
-                    "content": json.dumps(stato, indent=2, ensure_ascii=False)
-                }
-            }
-        }
-    )
+    for s in storico[-10:]:
+        try:
+            p = float(s["prezzo"].replace("€", "").replace(",", "."))
+            prezzi.append(p)
+            date.append(s["data"])
+        except:
+            continue
+
+    if len(prezzi) < 2:
+        return None
+
+    plt.figure()
+    plt.plot(prezzi)
+    plt.title(nome)
+    plt.xticks(range(len(date)), date, rotation=45)
+    plt.tight_layout()
+
+    file = "grafico.png"
+    plt.savefig(file)
+    plt.close()
+
+    return file
 
 # ─── SCRAPER ────────────────────────────────────────
 
 def scrape():
     prodotti = []
 
-    for URL in URLS:
-        print(f"Controllo: {URL}")
-
+    for nome_sito, URL in URLS.items():
         r = requests.get(URL, headers=HEADERS)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        cards = soup.select("li.product")
+        for c in soup.select("li.product"):
+            try:
+                nome = c.select_one(".woocommerce-loop-product__title").text.strip()
+                prezzo_raw = c.select_one(".price").text.strip()
+                link = c.select_one("a")["href"]
+                disponibile = not c.select_one(".out-of-stock")
 
-        for c in cards:
-            nome = c.select_one(".woocommerce-loop-product__title")
-            nome = nome.text.strip() if nome else "N/D"
-
-            prezzo = c.select_one(".price")
-            prezzo = prezzo.text.strip() if prezzo else "N/D"
-
-            link = c.select_one("a")
-            link = link["href"] if link else URL
-
-            disponibile = not c.select_one(".out-of-stock")
-
-            prodotti.append({
-                "nome": nome,
-                "prezzo": prezzo,
-                "disponibile": disponibile,
-                "link": link
-            })
+                prodotti.append({
+                    "nome": nome,
+                    "prezzo": prezzo_raw,
+                    "disponibile": disponibile,
+                    "link": link,
+                    "sito": nome_sito
+                })
+            except:
+                pass
 
     return prodotti
 
-# ─── CONFRONTO ──────────────────────────────────────
+# ─── CONFRONTO TRA SITI ─────────────────────────────
 
-def confronta(nuovi, vecchi):
-    variazioni = []
+def confronta_siti(prodotti):
+    mappa = {}
 
-    for p in nuovi:
+    for p in prodotti:
         nome = p["nome"]
-        v = vecchi.get(nome)
+        prezzo = estrai_prezzo(p["prezzo"])
 
-        if not v:
-            variazioni.append({**p, "tipo": "nuovo"})
+        if prezzo is None:
             continue
 
-        if v["prezzo"] != p["prezzo"]:
-            variazioni.append({
-                **p,
-                "tipo": "prezzo",
-                "prezzo_vecchio": v["prezzo"],
-                "prezzo_nuovo": p["prezzo"]
-            })
+        if nome not in mappa:
+            mappa[nome] = []
 
-        if v["disponibile"] != p["disponibile"]:
-            tipo = "disponibile" if p["disponibile"] else "esaurito"
-            variazioni.append({**p, "tipo": tipo})
+        mappa[nome].append({
+            "prezzo": prezzo,
+            "sito": p["sito"],
+            "link": p["link"]
+        })
 
-    return variazioni
+    for nome, lista in mappa.items():
+        if len(lista) < 2:
+            continue
+
+        lista.sort(key=lambda x: x["prezzo"])
+        migliore = lista[0]
+        peggiore = lista[-1]
+
+        diff = peggiore["prezzo"] - migliore["prezzo"]
+
+        if diff > 0:
+            testo = f"⚖️ *CONFRONTO PREZZI*\n\n"
+            testo += f"📦 {nome}\n\n"
+            testo += f"🏆 Migliore: {migliore['prezzo']}€ ({migliore['sito']})\n"
+            testo += f"💸 Peggiore: {peggiore['prezzo']}€ ({peggiore['sito']})\n"
+            testo += f"📉 Risparmi: {diff:.2f}€"
+
+            invia_telegram(testo, migliore["link"])
+
+def estrai_prezzo(p):
+    try:
+        return float(p.replace("€", "").replace(",", ".").strip())
+    except:
+        return None
+
+# ─── GIST ───────────────────────────────────────────
+
+def carica_stato():
+    r = requests.get(
+        f"https://api.github.com/gists/{GIST_ID}",
+        headers={"Authorization": f"token {GIST_TOKEN}"}
+    )
+    if r.ok:
+        return json.loads(r.json()["files"][GIST_FILE]["content"])
+    return {}
+
+def salva_stato(prodotti, vecchi):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    nuovo = {}
+
+    for p in prodotti:
+        nome = p["nome"]
+        storico = vecchi.get(nome, {}).get("storico", [])
+
+        storico.append({"prezzo": p["prezzo"], "data": now})
+        storico = storico[-50:]
+
+        nuovo[nome] = {
+            "prezzo": p["prezzo"],
+            "disponibile": p["disponibile"],
+            "link": p["link"],
+            "storico": storico
+        }
+
+    requests.patch(
+        f"https://api.github.com/gists/{GIST_ID}",
+        headers={"Authorization": f"token {GIST_TOKEN}"},
+        json={"files": {GIST_FILE: {"content": json.dumps(nuovo, indent=2)}}}
+    )
 
 # ─── MAIN ───────────────────────────────────────────
 
 def main():
-    print("Monitor avviato...")
-
-    nuovi = scrape()
+    prodotti = scrape()
     vecchi = carica_stato()
 
     if not vecchi:
-        print("Primo avvio → salvo stato")
-        salva_stato(nuovi)
+        salva_stato(prodotti, {})
+        invia_telegram("✅ Monitor attivo!")
         return
 
-    variazioni = confronta(nuovi, vecchi)
+    confronta_siti(prodotti)  # 🔥 QUI IL CONFRONTO
 
-    if variazioni:
-        print("⚠️ Cambiamenti trovati!")
-        invia_telegram(variazioni)
-        salva_stato(nuovi)
-    else:
-        print("Nessuna variazione")
+    salva_stato(prodotti, vecchi)
 
 if __name__ == "__main__":
     main()
