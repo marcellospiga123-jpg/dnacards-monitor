@@ -4,51 +4,61 @@ import json
 import os
 from datetime import datetime
 import matplotlib.pyplot as plt
+import statistics
 
 # ─── CONFIG ─────────────────────────────
 
-URLS = [
-    "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
-    "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
-    "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
-]
+URLS = {
+    "EN": "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
+    "JP": "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
+    "SINGLE": "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
+}
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-PREZZO_TARGET = 80
-DROP_FORTE = 0.85  # -15%
-
 STORICO_FILE = "storico.json"
 ALERT_FILE = "alert.json"
+MSG_FILE = "messages.json"
+
+PROFIT_MIN = 20
+ROI_MIN = 0.25
+CONFIDENCE_MIN = 60
 
 # ─── TELEGRAM ───────────────────────────
 
-def send_msg(text):
-    requests.post(
+def send_msg(text, log):
+    r = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         data={"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    )
+    ).json()
+
+    try:
+        log.append({
+            "id": r["result"]["message_id"],
+            "time": datetime.now().timestamp()
+        })
+    except:
+        pass
 
 def send_photo(path):
-    with open(path, "rb") as f:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-            files={"photo": f},
-            data={"chat_id": TELEGRAM_CHAT_ID}
-        )
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+        files={"photo": open(path, "rb")},
+        data={"chat_id": TELEGRAM_CHAT_ID}
+    )
 
 # ─── FILE ───────────────────────────────
 
 def load(name):
     if os.path.exists(name):
-        with open(name, "r", encoding="utf-8") as f:
+        with open(name) as f:
             return json.load(f)
     return {}
 
 def save(name, data):
-    with open(name, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    with open(name, "w") as f:
+        json.dump(data, f, indent=2)
 
 # ─── UTILS ──────────────────────────────
 
@@ -61,115 +71,116 @@ def p_float(p):
 # ─── SCRAPE ─────────────────────────────
 
 def scrape():
-    prodotti = []
+    prodotti = {}
 
-    for url in URLS:
-        r = requests.get(url, timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
+    for sito, url in URLS.items():
+        try:
+            r = requests.get(url)
+            soup = BeautifulSoup(r.text, "html.parser")
 
-        for c in soup.select("li.product"):
-            nome = c.select_one(".woocommerce-loop-product__title")
-            prezzo = c.select_one(".price .amount")
+            for c in soup.select("li.product"):
+                nome = c.select_one(".woocommerce-loop-product__title")
+                prezzo = c.select_one(".price .amount")
 
-            nome = nome.text.strip() if nome else "N/D"
-            prezzo = prezzo.text.strip() if prezzo else "0"
+                if not nome or not prezzo:
+                    continue
 
-            link = c.select_one("a")["href"]
+                nome = nome.text.strip()
 
-            prodotti.append({
-                "nome": nome,
-                "prezzo": prezzo,
-                "link": link
-            })
+                prodotti.setdefault(nome, []).append({
+                    "sito": sito,
+                    "prezzo": prezzo.text.strip(),
+                    "link": c.select_one("a")["href"]
+                })
+        except:
+            continue
 
     return prodotti
 
 # ─── STORICO ────────────────────────────
 
-def update_history(storico, prodotti):
-    now = datetime.now().strftime("%H:%M")
+def update(storico, prodotti):
+    t = datetime.now().strftime("%H:%M")
 
-    for p in prodotti:
-        nome = p["nome"]
+    for nome, varianti in prodotti.items():
+        best = min(varianti, key=lambda x: p_float(x["prezzo"]) or 9999)
 
-        if nome not in storico:
-            storico[nome] = []
-
-        storico[nome].append({
-            "t": now,
-            "p": p["prezzo"]
+        storico.setdefault(nome, []).append({
+            "t": t,
+            "p": best["prezzo"]
         })
 
     return storico
 
-# ─── ANALISI INTELLIGENTE ───────────────
+# ─── ANALISI ────────────────────────────
 
-def analyze(prodotti, storico, alerts):
-    msgs = []
+def analisi(prodotti, storico, alerts):
+    segnali = []
 
-    for p in prodotti:
-        nome = p["nome"]
-        prezzo = p_float(p["prezzo"])
+    for nome, varianti in prodotti.items():
+        prezzi = [(p_float(v["prezzo"]), v) for v in varianti if p_float(v["prezzo"])]
 
-        if not prezzo:
+        if not prezzi:
             continue
 
-        history = storico.get(nome, [])
-        prezzi = [p_float(d["p"]) for d in history if p_float(d["p"])]
+        best_price, best = min(prezzi, key=lambda x: x[0])
 
-        # TARGET
-        if prezzo <= PREZZO_TARGET:
-            key = f"T_{nome}"
+        hist = storico.get(nome, [])
+        valori = [p_float(x["p"]) for x in hist if p_float(x["p"])]
+
+        if len(valori) < 5:
+            continue
+
+        avg = sum(valori) / len(valori)
+        max_p = max(valori)
+
+        profitto = max_p - best_price
+        roi = profitto / best_price if best_price else 0
+
+        trend = valori[-1] - valori[-3]
+        vol = statistics.stdev(valori) if len(valori) > 2 else 0
+
+        score = 0
+        if best_price < avg: score += 30
+        if roi > ROI_MIN: score += 30
+        if trend >= 0: score += 20
+        if vol < avg * 0.2: score += 20
+
+        if profitto >= PROFIT_MIN and score >= CONFIDENCE_MIN:
+            key = f"Q_{nome}"
+
             if key not in alerts:
-                msgs.append(f"🎯 TARGET\n{nome}\n{prezzo}€\n{p['link']}")
+                qty = int(100 / best_price) if best_price else 1
+
+                msg = (
+                    f"🚨 QUANT TRADE\n\n"
+                    f"{nome}\n\n"
+                    f"🏪 Miglior prezzo: {best_price}€ ({best['sito']})\n"
+                    f"📈 Target: {round(max_p,2)}€\n"
+                    f"💸 Profitto/unità: {round(profitto,2)}€\n"
+                    f"📊 ROI: {round(roi*100,1)}%\n"
+                    f"⚡ Score: {score}/100\n\n"
+                    f"🧠 Strategia:\n"
+                    f"Compra ~{qty} pezzi → Profitto stimato: {round(qty*profitto,2)}€\n\n"
+                    f"{best['link']}"
+                )
+
+                segnali.append(msg)
                 alerts[key] = True
 
-        # MINIMO STORICO
-        if len(prezzi) > 2 and prezzo == min(prezzi):
-            key = f"M_{nome}"
-            if key not in alerts:
-                msgs.append(f"🔥 MINIMO STORICO\n{nome}\n{prezzo}€")
-                alerts[key] = True
-
-        # CALO FORTE
-        if len(prezzi) > 1 and prezzi[-1] < prezzi[-2] * DROP_FORTE:
-            key = f"D_{nome}"
-            if key not in alerts:
-                msgs.append(f"📉 CROLLO\n{nome}\n{prezzo}€")
-                alerts[key] = True
-
-        # BEST DEAL (combo)
-        if len(prezzi) > 3:
-            avg = sum(prezzi[:-1]) / (len(prezzi)-1)
-            if prezzo < avg * 0.8:
-                key = f"B_{nome}"
-                if key not in alerts:
-                    msgs.append(f"💸 BEST DEAL\n{nome}\n{prezzo}€")
-                    alerts[key] = True
-
-    return msgs
+    return segnali
 
 # ─── GRAFICO ────────────────────────────
 
-def make_graph(storico):
+def grafico(storico):
     plt.figure()
 
-    i = 0
-    for nome, dati in storico.items():
-        if i >= 3:
-            break
-
-        prezzi = []
-        for d in dati[-10:]:
-            pf = p_float(d["p"])
-            if pf:
-                prezzi.append(pf)
-
+    for nome, dati in list(storico.items())[:5]:
+        prezzi = [p_float(d["p"]) for d in dati if p_float(d["p"])]
         if len(prezzi) > 1:
-            plt.plot(prezzi, label=nome[:15])
-            i += 1
+            plt.plot(prezzi, label=nome[:12])
 
-    if i == 0:
+    if not plt.gca().has_data():
         return None
 
     plt.legend()
@@ -182,28 +193,24 @@ def make_graph(storico):
 # ─── MAIN ───────────────────────────────
 
 def main():
-    send_msg("🤖 BOT FINAL BOSS ONLINE")
-
     storico = load(STORICO_FILE)
     alerts = load(ALERT_FILE)
 
     prodotti = scrape()
+    storico = update(storico, prodotti)
 
-    storico = update_history(storico, prodotti)
+    segnali = analisi(prodotti, storico, alerts)
 
-    msgs = analyze(prodotti, storico, alerts)
+    for s in segnali:
+        send_msg(s, [])
 
-    for m in msgs:
-        send_msg(m)
-
-    g = make_graph(storico)
-    if g:
-        send_photo(g)
+    if segnali:
+        g = grafico(storico)
+        if g:
+            send_photo(g)
 
     save(STORICO_FILE, storico)
     save(ALERT_FILE, alerts)
-
-# ─── RUN ────────────────────────────────
 
 if __name__ == "__main__":
     main()
