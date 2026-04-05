@@ -20,7 +20,7 @@ jobs:
 
       - name: Installa dipendenze
         run: |
-          pip install playwright requests
+          pip install requests beautifulsoup4
           
 
       - name: Debug (opzionale ma utile)
