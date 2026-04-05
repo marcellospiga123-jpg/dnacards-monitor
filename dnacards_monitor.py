@@ -1,110 +1,198 @@
 import requests
+from bs4 import BeautifulSoup
 import json
-import time
-import base64
 import os
+import base64
+from datetime import datetime
+import matplotlib.pyplot as plt
+import statistics
 
-# ==============================
-# CONFIG (usa Secrets GitHub)
-# ==============================
+# ================= CONFIG =================
+URLS = {
+    "JP": "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
+    "EN": "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
+    "SINGLE": "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
+}
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 REPO = "marcellospiga123-jpg/dna-dashboard"
-FILE_PATH = "storico.json"
+FILE = "storico.json"
 
-# ==============================
-# TELEGRAM (CON DEBUG)
-# ==============================
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-    
+# ================= TELEGRAM =================
+def send(msg):
     try:
-        r = requests.post(url, data=data)
-        print("TELEGRAM RESPONSE:", r.text)
-    except Exception as e:
-        print("ERRORE TELEGRAM:", e)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+        )
+    except:
+        print("Errore Telegram")
 
-# ==============================
-# GITHUB LOAD SICURO
-# ==============================
-def load_github():
-    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
+# ================= GITHUB =================
+def load():
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
     r = requests.get(url, headers=headers)
 
     if r.status_code == 200:
         data = r.json()
-
-        # 🔥 FIX ERRORE content
-        if "content" not in data:
-            print("File vuoto o formato errato")
-            return [], None
-
         content = base64.b64decode(data["content"]).decode()
         return json.loads(content), data["sha"]
 
-    else:
-        print("File non trovato, ne creo uno nuovo")
-        return [], None
+    return {}, None
 
-# ==============================
-# GITHUB SAVE
-# ==============================
-def save_github(data, sha):
-    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
+def save(data, sha):
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
     content = base64.b64encode(json.dumps(data, indent=2).encode()).decode()
 
     body = {
-        "message": "update storico",
-        "content": content,
-        "sha": sha
+        "message": "update prezzi",
+        "content": content
     }
+
+    if sha:
+        body["sha"] = sha
 
     requests.put(url, headers=headers, json=body)
 
-# ==============================
-# DATI FAKE (SIMULAZIONE)
-# ==============================
-def get_data():
-    # Simula prezzi
-    return [
-        {"name": "Carta A", "price": 10 + int(time.time()) % 5},
-        {"name": "Carta B", "price": 20 + int(time.time()) % 3},
-    ]
+# ================= UTILS =================
+def price(p):
+    try:
+        return float(p.replace("€","").replace(",","."))
+    except:
+        return None
 
-# ==============================
-# MAIN
-# ==============================
+# ================= SCRAPER =================
+def scrape():
+    prodotti = {}
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    for sito, url in URLS.items():
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            for p in soup.select("li.product"):
+                nome = p.select_one(".woocommerce-loop-product__title")
+                prezzo = p.select_one(".price .amount")
+
+                if not nome:
+                    continue
+
+                nome = nome.text.strip()
+
+                if prezzo:
+                    prezzo_txt = prezzo.text.strip()
+                else:
+                    prezzo_txt = "OUT"
+
+                prodotti.setdefault(nome, []).append({
+                    "sito": sito,
+                    "prezzo": prezzo_txt
+                })
+
+        except:
+            continue
+
+    return prodotti
+
+# ================= ANALISI =================
+def analisi(prodotti, storico):
+    segnali = []
+
+    for nome, varianti in prodotti.items():
+        prezzi = [price(v["prezzo"]) for v in varianti if price(v["prezzo"])]
+
+        if not prezzi:
+            continue
+
+        best = min(prezzi)
+        hist = storico.get(nome, [])
+
+        valori = [price(x["p"]) for x in hist if price(x["p"])]
+
+        if len(valori) < 3:
+            continue
+
+        avg = sum(valori)/len(valori)
+        max_p = max(valori)
+
+        profit = max_p - best
+        roi = profit / best if best else 0
+
+        if profit > 10 and roi > 0.2:
+            segnali.append(f"""
+🔥 DEAL
+
+{nome}
+
+💰 Prezzo: {best}€
+📈 Target: {round(max_p,2)}€
+ROI: {round(roi*100,1)}%
+""")
+
+    return segnali
+
+# ================= UPDATE =================
+def update(storico, prodotti):
+    t = datetime.now().strftime("%H:%M")
+
+    for nome, varianti in prodotti.items():
+        prezzi = [v for v in varianti if price(v["prezzo"])]
+
+        if not prezzi:
+            continue
+
+        best = min(prezzi, key=lambda x: price(x["prezzo"]))
+
+        storico.setdefault(nome, []).append({
+            "t": t,
+            "p": best["prezzo"]
+        })
+
+    return storico
+
+# ================= GRAFICO =================
+def grafico(storico):
+    plt.figure()
+
+    for nome, dati in list(storico.items())[:5]:
+        prezzi = [price(d["p"]) for d in dati if price(d["p"])]
+        if len(prezzi) > 1:
+            plt.plot(prezzi, label=nome[:10])
+
+    if not plt.gca().has_data():
+        return
+
+    plt.legend()
+    plt.savefig("grafico.png")
+    plt.close()
+
+# ================= MAIN =================
 def main():
-    # 🔥 TEST TELEGRAM
-    send_telegram("🚀 BOT AVVIATO CORRETTAMENTE")
+    send("🤖 BOT ATTIVO")
 
-    storico, sha = load_github()
-    nuovi_dati = get_data()
+    storico, sha = load()
 
-    alert = False
+    prodotti = scrape()
+    storico = update(storico, prodotti)
 
-    for item in nuovi_dati:
-        for old in storico:
-            if item["name"] == old["name"]:
-                if item["price"] > old["price"]:
-                    msg = f"📈 {item['name']} salita!\n{old['price']} → {item['price']}"
-                    send_telegram(msg)
-                    alert = True
+    segnali = analisi(prodotti, storico)
 
-    save_github(nuovi_dati, sha)
+    for s in segnali:
+        send(s)
 
-    if not alert:
-        print("Nessun cambiamento")
+    if segnali:
+        grafico(storico)
 
-# ==============================
-# START
-# ==============================
+    save(storico, sha)
+
 if __name__ == "__main__":
     main()
