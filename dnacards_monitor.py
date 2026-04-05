@@ -1,4 +1,5 @@
 """
+L
 DNA Cards - Monitor prezzi e disponibilità
 Versione GitHub Actions — gira una volta sola, stato salvato su GitHub Gist
 """
