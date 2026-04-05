@@ -14,16 +14,22 @@ URLS = {
     "SINGLE": "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
 }
 
+WATCHLIST = ["OP-05", "OP-06", "OP-07"]
+TARGET_PRICE = 80
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 STORICO_FILE = "storico.json"
 ALERT_FILE = "alert.json"
+STOCK_FILE = "stock.json"
+HEARTBEAT_FILE = "heartbeat.json"
 MSG_FILE = "messages.json"
 
 PROFIT_MIN = 20
 ROI_MIN = 0.25
 CONFIDENCE_MIN = 60
+HEARTBEAT_HOURS = 3
 
 # ─── TELEGRAM ───────────────────────────
 
@@ -41,11 +47,25 @@ def send_msg(text, log):
     except:
         pass
 
-def send_photo(path):
-    requests.post(
+def send_photo(path, log):
+    r = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
         files={"photo": open(path, "rb")},
         data={"chat_id": TELEGRAM_CHAT_ID}
+    ).json()
+
+    try:
+        log.append({
+            "id": r["result"]["message_id"],
+            "time": datetime.now().timestamp()
+        })
+    except:
+        pass
+
+def delete_msg(msg_id):
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage",
+        data={"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id}
     )
 
 # ─── FILE ───────────────────────────────
@@ -79,18 +99,23 @@ def scrape():
             soup = BeautifulSoup(r.text, "html.parser")
 
             for c in soup.select("li.product"):
-                nome = c.select_one(".woocommerce-loop-product__title")
-                prezzo = c.select_one(".price .amount")
+                nome_el = c.select_one(".woocommerce-loop-product__title")
+                prezzo_el = c.select_one(".price .amount")
 
-                if not nome or not prezzo:
+                if not nome_el or not prezzo_el:
                     continue
 
-                nome = nome.text.strip()
+                nome = nome_el.text.strip()
+                prezzo = prezzo_el.text.strip()
+
+                out = c.select_one(".out-of-stock")
+                disponibile = False if out else True
 
                 prodotti.setdefault(nome, []).append({
                     "sito": sito,
-                    "prezzo": prezzo.text.strip(),
-                    "link": c.select_one("a")["href"]
+                    "prezzo": prezzo,
+                    "link": c.select_one("a")["href"],
+                    "disponibile": disponibile
                 })
         except:
             continue
@@ -112,14 +137,76 @@ def update(storico, prodotti):
 
     return storico
 
+# ─── AI ─────────────────────────────────
+
+def predict_price(valori):
+    if len(valori) < 5:
+        return None
+
+    trend = valori[-1] - valori[0]
+    slope = trend / len(valori)
+
+    return round(valori[-1] + slope * 5, 2)
+
+def get_ebay_price(nome):
+    try:
+        query = nome.replace(" ", "+")
+        url = f"https://www.ebay.it/sch/i.html?_nkw={query}"
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        prezzi = []
+
+        for p in soup.select(".s-item__price")[:10]:
+            text = p.text.replace("€", "").replace(",", ".")
+            try:
+                val = float(text.split()[0])
+                if 5 < val < 500:
+                    prezzi.append(val)
+            except:
+                continue
+
+        if prezzi:
+            return round(sum(prezzi)/len(prezzi), 2)
+
+    except:
+        pass
+
+    return None
+
+# ─── STOCK ──────────────────────────────
+
+def check_stock(prodotti, old_stock, log):
+    new_stock = {}
+
+    for nome, varianti in prodotti.items():
+        disponibile = any(v["disponibile"] for v in varianti)
+        new_stock[nome] = disponibile
+
+        old = old_stock.get(nome)
+
+        if old is None:
+            continue
+
+        if old != disponibile:
+            if disponibile:
+                send_msg(f"✅ DISPONIBILE\n{nome}", log)
+            else:
+                send_msg(f"❌ ESAURITO\n{nome}", log)
+
+    return new_stock
+
 # ─── ANALISI ────────────────────────────
 
-def analisi(prodotti, storico, alerts):
+def analisi(prodotti, storico, alerts, log):
     segnali = []
 
     for nome, varianti in prodotti.items():
-        prezzi = [(p_float(v["prezzo"]), v) for v in varianti if p_float(v["prezzo"])]
 
+        prezzi = [(p_float(v["prezzo"]), v) for v in varianti if p_float(v["prezzo"])]
         if not prezzi:
             continue
 
@@ -131,42 +218,23 @@ def analisi(prodotti, storico, alerts):
         if len(valori) < 5:
             continue
 
-        avg = sum(valori) / len(valori)
-        max_p = max(valori)
+        avg = sum(valori)/len(valori)
+        pred = predict_price(valori)
+        ebay = get_ebay_price(nome)
 
-        profitto = max_p - best_price
-        roi = profitto / best_price if best_price else 0
-
-        trend = valori[-1] - valori[-3]
-        vol = statistics.stdev(valori) if len(valori) > 2 else 0
+        profit = (pred or avg) - best_price
+        roi = profit / best_price if best_price else 0
 
         score = 0
         if best_price < avg: score += 30
         if roi > ROI_MIN: score += 30
-        if trend >= 0: score += 20
-        if vol < avg * 0.2: score += 20
+        if ebay and best_price < ebay: score += 20
 
-        if profitto >= PROFIT_MIN and score >= CONFIDENCE_MIN:
-            key = f"Q_{nome}"
-
-            if key not in alerts:
-                qty = int(100 / best_price) if best_price else 1
-
-                msg = (
-                    f"🚨 QUANT TRADE\n\n"
-                    f"{nome}\n\n"
-                    f"🏪 Miglior prezzo: {best_price}€ ({best['sito']})\n"
-                    f"📈 Target: {round(max_p,2)}€\n"
-                    f"💸 Profitto/unità: {round(profitto,2)}€\n"
-                    f"📊 ROI: {round(roi*100,1)}%\n"
-                    f"⚡ Score: {score}/100\n\n"
-                    f"🧠 Strategia:\n"
-                    f"Compra ~{qty} pezzi → Profitto stimato: {round(qty*profitto,2)}€\n\n"
-                    f"{best['link']}"
-                )
-
+        if profit > PROFIT_MIN and score > CONFIDENCE_MIN:
+            if nome not in alerts:
+                msg = f"🚨 TRADE\n{nome}\n💰 {best_price}€\n📈 ROI {round(roi*100,1)}%\n🌐 eBay {ebay}"
                 segnali.append(msg)
-                alerts[key] = True
+                alerts[nome] = True
 
     return segnali
 
@@ -178,16 +246,12 @@ def grafico(storico):
     for nome, dati in list(storico.items())[:5]:
         prezzi = [p_float(d["p"]) for d in dati if p_float(d["p"])]
         if len(prezzi) > 1:
-            plt.plot(prezzi, label=nome[:12])
-
-    if not plt.gca().has_data():
-        return None
+            plt.plot(prezzi, label=nome[:10])
 
     plt.legend()
     file = "grafico.png"
     plt.savefig(file)
     plt.close()
-
     return file
 
 # ─── MAIN ───────────────────────────────
@@ -195,22 +259,25 @@ def grafico(storico):
 def main():
     storico = load(STORICO_FILE)
     alerts = load(ALERT_FILE)
+    stock_old = load(STOCK_FILE)
+    log = load(MSG_FILE)
 
     prodotti = scrape()
     storico = update(storico, prodotti)
 
-    segnali = analisi(prodotti, storico, alerts)
+    stock_new = check_stock(prodotti, stock_old, log)
+    segnali = analisi(prodotti, storico, alerts, log)
 
     for s in segnali:
-        send_msg(s, [])
+        send_msg(s, log)
 
     if segnali:
-        g = grafico(storico)
-        if g:
-            send_photo(g)
+        send_photo(grafico(storico), log)
 
     save(STORICO_FILE, storico)
     save(ALERT_FILE, alerts)
+    save(STOCK_FILE, stock_new)
+    save(MSG_FILE, log)
 
 if __name__ == "__main__":
     main()
