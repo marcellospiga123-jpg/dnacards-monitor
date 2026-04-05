@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import os
+import base64
 from datetime import datetime
 import matplotlib.pyplot as plt
 import statistics
@@ -14,58 +15,38 @@ URLS = {
     "SINGLE": "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
 }
 
-WATCHLIST = ["OP-05", "OP-06", "OP-07"]
-TARGET_PRICE = 80
-
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-STORICO_FILE = "storico.json"
+GITHUB_TOKEN = "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"
+REPO = "marcello123/dna-dashboard"
+FILE_PATH = "storico.json"
+
 ALERT_FILE = "alert.json"
-STOCK_FILE = "stock.json"
-HEARTBEAT_FILE = "heartbeat.json"
-MSG_FILE = "messages.json"
 
 PROFIT_MIN = 20
 ROI_MIN = 0.25
 CONFIDENCE_MIN = 60
-HEARTBEAT_HOURS = 3
 
 # ─── TELEGRAM ───────────────────────────
 
-def send_msg(text, log):
-    r = requests.post(
+def send_msg(text):
+    if not TELEGRAM_TOKEN:
+        return
+
+    requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         data={"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    ).json()
+    )
 
-    try:
-        log.append({
-            "id": r["result"]["message_id"],
-            "time": datetime.now().timestamp()
-        })
-    except:
-        pass
+def send_photo(path):
+    if not TELEGRAM_TOKEN:
+        return
 
-def send_photo(path, log):
-    r = requests.post(
+    requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
         files={"photo": open(path, "rb")},
-        data={"chat_id": TELEGRAM_CHATGRAM_CHAT_ID}
-    ).json()
-
-    try:
-        log.append({
-            "id": r["result"]["message_id"],
-            "time": datetime.now().timestamp()
-        })
-    except:
-        pass
-
-def delete_msg(msg_id):
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage",
-        data={"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id}
+        data={"chat_id": TELEGRAM_CHAT_ID}
     )
 
 # ─── FILE ───────────────────────────────
@@ -79,6 +60,29 @@ def load(name):
 def save(name, data):
     with open(name, "w") as f:
         json.dump(data, f, indent=2)
+
+# ─── GITHUB ─────────────────────────────
+
+def load_github():
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
+    r = requests.get(url, headers={"Authorization": f"token {GITHUB_TOKEN}"}).json()
+
+    content = base64.b64decode(r["content"]).decode()
+    return json.loads(content), r["sha"]
+
+def upload_github(data, sha):
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
+
+    content = base64.b64encode(json.dumps(data, indent=2).encode()).decode()
+
+    requests.put(url,
+        headers={"Authorization": f"token {GITHUB_TOKEN}"},
+        json={
+            "message": "update storico prezzi",
+            "content": content,
+            "sha": sha
+        }
+    )
 
 # ─── UTILS ──────────────────────────────
 
@@ -99,23 +103,18 @@ def scrape():
             soup = BeautifulSoup(r.text, "html.parser")
 
             for c in soup.select("li.product"):
-                nome_el = c.select_one(".woocommerce-loop-product__title")
-                prezzo_el = c.select_one(".price .amount")
+                nome = c.select_one(".woocommerce-loop-product__title")
+                prezzo = c.select_one(".price .amount")
 
-                if not nome_el or not prezzo_el:
+                if not nome or not prezzo:
                     continue
 
-                nome = nome_el.text.strip()
-                prezzo = prezzo_el.text.strip()
-
-                out = c.select_one(".out-of-stock")
-                disponibile = False if out else True
+                nome = nome.text.strip()
 
                 prodotti.setdefault(nome, []).append({
                     "sito": sito,
-                    "prezzo": prezzo,
-                    "link": c.select_one("a")["href"],
-                    "disponibile": disponibile
+                    "prezzo": prezzo.text.strip(),
+                    "link": c.select_one("a")["href"]
                 })
         except:
             continue
@@ -137,79 +136,14 @@ def update(storico, prodotti):
 
     return storico
 
-# ─── AI PREVISIONE ──────────────────────
+# ─── ANALISI ────────────────────────────
 
-def predict_price(valori):
-    if len(valori) < 5:
-        return None
-
-    trend = valori[-1] - valori[0]
-    slope = trend / len(valori)
-
-    return round(valori[-1] + slope * 5, 2)
-
-# ─── EBAY ───────────────────────────────
-
-def get_ebay_price(nome):
-    try:
-        query = nome.replace(" ", "+")
-        url = f"https://www.ebay.it/sch/i.html?_nkw={query}"
-
-        headers = {"User-Agent": "Mozilla/5.0"}
-
-        r = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        prezzi = []
-
-        for p in soup.select(".s-item__price")[:10]:
-            text = p.text.replace("€", "").replace(",", ".")
-            try:
-                val = float(text.split()[0])
-                if 5 < val < 500:
-                    prezzi.append(val)
-            except:
-                continue
-
-        if prezzi:
-            return round(sum(prezzi)/len(prezzi), 2)
-
-    except:
-        pass
-
-    return None
-
-# ─── STOCK ──────────────────────────────
-
-def check_stock(prodotti, old_stock, log):
-    new_stock = {}
-
-    for nome, varianti in prodotti.items():
-        disponibile = any(v["disponibile"] for v in varianti)
-        new_stock[nome] = disponibile
-
-        old = old_stock.get(nome)
-
-        if old is None:
-            continue
-
-        if old != disponibile:
-            if disponibile:
-                send_msg(f"✅ TORNATO DISPONIBILE\n\n{nome}", log)
-            else:
-                send_msg(f"❌ ESAURITO\n\n{nome}", log)
-
-    return new_stock
-
-# ─── ANALISI COMPLETA ───────────────────
-
-def analisi(prodotti, storico, alerts, log):
+def analisi(prodotti, storico, alerts):
     segnali = []
 
     for nome, varianti in prodotti.items():
-        is_watch = any(w in nome for w in WATCHLIST)
-
         prezzi = [(p_float(v["prezzo"]), v) for v in varianti if p_float(v["prezzo"])]
+
         if not prezzi:
             continue
 
@@ -224,22 +158,17 @@ def analisi(prodotti, storico, alerts, log):
         avg = sum(valori) / len(valori)
         max_p = max(valori)
 
-        pred = predict_price(valori)
-        ebay_price = get_ebay_price(nome)
-
-        profitto = (pred or max_p) - best_price
+        profitto = max_p - best_price
         roi = profitto / best_price if best_price else 0
 
-        score = 0
-        if best_price < avg: score += 25
-        if roi > ROI_MIN: score += 25
-        if pred and pred > avg: score += 15
-        if is_watch: score += 15
-        if ebay_price and best_price < ebay_price: score += 20
+        trend = valori[-1] - valori[-3]
+        vol = statistics.stdev(valori) if len(valori) > 2 else 0
 
-        # TARGET ALERT
-        if best_price < TARGET_PRICE:
-            send_msg(f"🎯 TARGET HIT\n{nome}\n💰 {best_price}€\n{best['link']}", log)
+        score = 0
+        if best_price < avg: score += 30
+        if roi > ROI_MIN: score += 30
+        if trend >= 0: score += 20
+        if vol < avg * 0.2: score += 20
 
         if profitto >= PROFIT_MIN and score >= CONFIDENCE_MIN:
             key = f"Q_{nome}"
@@ -248,14 +177,14 @@ def analisi(prodotti, storico, alerts, log):
                 qty = int(100 / best_price) if best_price else 1
 
                 msg = (
-                    f"🚨 AI TRADE\n\n"
+                    f"🚨 QUANT TRADE\n\n"
                     f"{nome}\n\n"
-                    f"💰 Prezzo: {best_price}€ ({best['sito']})\n"
-                    f"🌐 eBay: {ebay_price}€\n"
-                    f"🔮 Predizione: {pred}€\n"
-                    f"📈 ROI: {round(roi*100,1)}%\n"
+                    f"🏪 Miglior prezzo: {best_price}€ ({best['sito']})\n"
+                    f"📈 Target: {round(max_p,2)}€\n"
+                    f"💸 Profitto/unità: {round(profitto,2)}€\n"
+                    f"📊 ROI: {round(roi*100,1)}%\n"
                     f"⚡ Score: {score}/100\n\n"
-                    f"🧠 Compra ~{qty} → Profitto stimato: {round(qty*profitto,2)}€\n\n"
+                    f"🧠 Compra ~{qty} pezzi\n\n"
                     f"{best['link']}"
                 )
 
@@ -284,61 +213,32 @@ def grafico(storico):
 
     return file
 
-# ─── HEARTBEAT ──────────────────────────
-
-def heartbeat(log):
-    data = load(HEARTBEAT_FILE)
-    now = datetime.now().timestamp()
-
-    if now - data.get("last", 0) > HEARTBEAT_HOURS * 3600:
-        send_msg("🤖 AI TRADER ONLINE", log)
-        data["last"] = now
-        save(HEARTBEAT_FILE, data)
-
-# ─── CLEAN ──────────────────────────────
-
-def clean_messages(log):
-    now = datetime.now().timestamp()
-    keep = []
-
-    for m in log:
-        if now - m["time"] > 86400:
-            delete_msg(m["id"])
-        else:
-            keep.append(m)
-
-    return keep
-
 # ─── MAIN ───────────────────────────────
 
 def main():
-    storico = load(STORICO_FILE)
     alerts = load(ALERT_FILE)
-    old_stock = load(STOCK_FILE)
-    log = load(MSG_FILE)
 
     prodotti = scrape()
+
+    # 🔥 prende storico da GitHub
+    storico, sha = load_github()
+
     storico = update(storico, prodotti)
 
-    new_stock = check_stock(prodotti, old_stock, log)
-
-    segnali = analisi(prodotti, storico, alerts, log)
+    segnali = analisi(prodotti, storico, alerts)
 
     for s in segnali:
-        send_msg(s, log)
+        send_msg(s)
 
     if segnali:
         g = grafico(storico)
         if g:
-            send_photo(g, log)
+            send_photo(g)
 
-    heartbeat(log)
-    log = clean_messages(log)
-
-    save(STORICO_FILE, storico)
     save(ALERT_FILE, alerts)
-    save(STOCK_FILE, new_stock)
-    save(MSG_FILE, log)
+
+    # 🔥 salva su GitHub
+    upload_github(storico, sha)
 
 if __name__ == "__main__":
     main()
