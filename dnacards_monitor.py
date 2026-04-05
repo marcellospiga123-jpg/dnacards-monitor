@@ -66,8 +66,9 @@ def scrape_prodotti():
     prodotti = []
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    headless=True,
+    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+)
         )
         page = browser.new_page()
         page.set_extra_http_headers({
