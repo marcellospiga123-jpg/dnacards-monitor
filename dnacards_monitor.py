@@ -1,6 +1,6 @@
 """
 DNA Cards - Monitor prezzi e disponibilità
-Versione per GitHub Actions — stato salvato su GitHub Gist
+Versione GitHub Actions — gira una volta sola, stato salvato su GitHub Gist
 """
 
 import json
@@ -8,7 +8,6 @@ import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -17,65 +16,82 @@ from playwright.sync_api import sync_playwright
 
 URL = "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/"
 
-EMAIL_ATTIVA = True
-EMAIL_MITTENTE = os.environ.get("marcellospiga123@gmail.com", "")
-EMAIL_PASSWORD = os.environ.get("hgwobgaymsgqnebf", "")
-EMAIL_DESTINATARIO = os.environ.get("marcellospiga123@gmail.com", "")
-EMAIL_SMTP = "smtp.gmail.com"
-EMAIL_PORT = 587
+EMAIL_ATTIVA       = True
+EMAIL_MITTENTE     = os.environ.get("EMAIL_MITTENTE", "")
+EMAIL_PASSWORD     = os.environ.get("EMAIL_PASSWORD", "")
+EMAIL_DESTINATARIO = os.environ.get("EMAIL_DESTINATARIO", "")
+EMAIL_SMTP         = "smtp.gmail.com"
+EMAIL_PORT         = 587
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GIST_ID = os.environ.get("GIST_ID", "")
-GIST_FILENAME = "dnacards_stato.json"
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+GIST_ID    = os.environ.get("GIST_ID", "")
+GIST_FILE  = "dnacards_stato.json"
 
-# ─── GIST (memoria persistente) ──────────────────────────────────────────────
+# ─── STATO SU GIST ───────────────────────────────────────────────────────────
 
-def carica_stato_da_gist():
-    if not GIST_ID or not GITHUB_TOKEN:
+def carica_stato():
+    if not GIST_ID or not GIST_TOKEN:
         return {}
     try:
         r = requests.get(
             f"https://api.github.com/gists/{GIST_ID}",
-            headers={"Authorization": f"token {GITHUB_TOKEN}"},
-            timeout=10
+            headers={"Authorization": f"token {GIST_TOKEN}"},
+            timeout=10,
         )
         if r.ok:
-            contenuto = r.json()["files"].get(GIST_FILENAME, {}).get("content", "{}")
-            return json.loads(contenuto)
+            content = r.json()["files"].get(GIST_FILE, {}).get("content", "{}")
+            return json.loads(content)
     except Exception as e:
-        print(f"  [!] Errore lettura Gist: {e}")
+        print(f"  [!] Errore caricamento stato: {e}")
     return {}
 
-def salva_stato_su_gist(prodotti):
-    if not GIST_ID or not GITHUB_TOKEN:
+def salva_stato(prodotti):
+    if not GIST_ID or not GIST_TOKEN:
         return
     stato = {p["nome"]: {"prezzo": p["prezzo"], "disponibile": p["disponibile"]} for p in prodotti}
     try:
-        r = requests.patch(
+        requests.patch(
             f"https://api.github.com/gists/{GIST_ID}",
-            headers={"Authorization": f"token {GITHUB_TOKEN}"},
-            json={"files": {GIST_FILENAME: {"content": json.dumps(stato, ensure_ascii=False, indent=2)}}},
-            timeout=10
+            headers={"Authorization": f"token {GIST_TOKEN}"},
+            json={"files": {GIST_FILE: {"content": json.dumps(stato, ensure_ascii=False, indent=2)}}},
+            timeout=10,
         )
-        if r.ok:
-            print("  Stato salvato su Gist.")
-        else:
-            print(f"  [!] Errore salvataggio Gist: {r.text}")
+        print("  Stato salvato su Gist.")
     except Exception as e:
-        print(f"  [!] Errore salvataggio Gist: {e}")
+        print(f"  [!] Errore salvataggio stato: {e}")
 
 # ─── SCRAPING ────────────────────────────────────────────────────────────────
 
 def scrape_prodotti():
     prodotti = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
         page = browser.new_page()
-        page.set_extra_http_headers({"User-Agent": "Mozilla/5.0"})
-        page.goto(URL, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(2000)
+        page.set_extra_http_headers({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        })
+
+        # Timeout aumentato a 60 secondi, attesa su domcontentloaded (più veloce)
+        try:
+            page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            # Se ancora timeout, proviamo senza aspettare nulla
+            page.goto(URL, wait_until="commit", timeout=60000)
+
+        # Aspetta che appaiano i prodotti
+        try:
+            page.wait_for_selector("li.product", timeout=15000)
+        except Exception:
+            print("  [!] Selettore prodotti non trovato, provo comunque...")
+
+        page.wait_for_timeout(3000)
 
         cards = page.query_selector_all("li.product")
+        print(f"  Trovati {len(cards)} prodotti nella pagina.")
+
         for card in cards:
             try:
                 nome_el = card.query_selector(".woocommerce-loop-product__title")
@@ -123,38 +139,72 @@ def confronta(prodotti_nuovi, stato_vecchio):
         vecchio = stato_vecchio.get(nome)
 
         if vecchio is None:
-            variazioni.append({"tipo": "nuovo", "nome": nome, "prezzo": p["prezzo"], "disponibile": p["disponibile"], "link": p["link"]})
+            variazioni.append({
+                "tipo": "nuovo",
+                "nome": nome,
+                "prezzo": p["prezzo"],
+                "disponibile": p["disponibile"],
+                "link": p["link"],
+            })
             continue
 
         if vecchio["prezzo"] != p["prezzo"]:
-            variazioni.append({"tipo": "prezzo", "nome": nome, "prezzo_vecchio": vecchio["prezzo"], "prezzo_nuovo": p["prezzo"], "disponibile": p["disponibile"], "link": p["link"]})
+            variazioni.append({
+                "tipo": "prezzo",
+                "nome": nome,
+                "prezzo_vecchio": vecchio["prezzo"],
+                "prezzo_nuovo": p["prezzo"],
+                "disponibile": p["disponibile"],
+                "link": p["link"],
+            })
 
         if vecchio["disponibile"] != p["disponibile"]:
             tipo = "tornato_disponibile" if p["disponibile"] else "esaurito"
-            variazioni.append({"tipo": tipo, "nome": nome, "prezzo": p["prezzo"], "link": p["link"]})
+            variazioni.append({
+                "tipo": tipo,
+                "nome": nome,
+                "prezzo": p["prezzo"],
+                "link": p["link"],
+            })
 
     return variazioni
 
 # ─── NOTIFICHE ───────────────────────────────────────────────────────────────
 
 def formatta_messaggio(variazioni):
-    righe = [f"DNA Cards — {len(variazioni)} variazione/i rilevata/e\n"]
+    righe = [f"🔔 DNA Cards — {len(variazioni)} variazione/i rilevata/e\n"]
     for v in variazioni:
         if v["tipo"] == "prezzo":
-            righe.append(f"PREZZO CAMBIATO: {v['nome']}\n{v['prezzo_vecchio']} -> {v['prezzo_nuovo']}\n{v['link']}")
+            righe.append(
+                f"💰 PREZZO CAMBIATO: {v['nome']}\n"
+                f"   {v['prezzo_vecchio']} → {v['prezzo_nuovo']}\n"
+                f"   {v['link']}"
+            )
         elif v["tipo"] == "esaurito":
-            righe.append(f"ESAURITO: {v['nome']}\nPrezzo: {v.get('prezzo', 'N/D')}\n{v['link']}")
+            righe.append(
+                f"❌ ESAURITO: {v['nome']}\n"
+                f"   Prezzo: {v.get('prezzo', 'N/D')}\n"
+                f"   {v['link']}"
+            )
         elif v["tipo"] == "tornato_disponibile":
-            righe.append(f"TORNATO DISPONIBILE: {v['nome']}\nPrezzo: {v.get('prezzo', 'N/D')}\n{v['link']}")
+            righe.append(
+                f"✅ TORNATO DISPONIBILE: {v['nome']}\n"
+                f"   Prezzo: {v.get('prezzo', 'N/D')}\n"
+                f"   {v['link']}"
+            )
         elif v["tipo"] == "nuovo":
             stato = "Disponibile" if v["disponibile"] else "Esaurito"
-            righe.append(f"NUOVO PRODOTTO: {v['nome']}\nPrezzo: {v.get('prezzo', 'N/D')} - {stato}\n{v['link']}")
+            righe.append(
+                f"🆕 NUOVO PRODOTTO: {v['nome']}\n"
+                f"   Prezzo: {v.get('prezzo', 'N/D')} — {stato}\n"
+                f"   {v['link']}"
+            )
     return "\n\n".join(righe)
 
 def invia_email(testo):
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = "DNA Cards — Variazione prezzo/disponibilita"
+        msg["Subject"] = "DNA Cards — Variazione prezzo/disponibilità"
         msg["From"] = EMAIL_MITTENTE
         msg["To"] = EMAIL_DESTINATARIO
         msg.attach(MIMEText(testo, "plain", "utf-8"))
@@ -162,7 +212,7 @@ def invia_email(testo):
             server.starttls()
             server.login(EMAIL_MITTENTE, EMAIL_PASSWORD)
             server.sendmail(EMAIL_MITTENTE, EMAIL_DESTINATARIO, msg.as_string())
-        print("  Email inviata.")
+        print("  ✉️  Email inviata.")
     except Exception as e:
         print(f"  [!] Errore email: {e}")
 
@@ -177,30 +227,34 @@ def invia_notifiche(variazioni):
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    ora = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ora}] DNA Cards Monitor — controllo in corso...")
+    print("🤖 DNA Cards Monitor — controllo in corso...")
+    print(f"   URL: {URL}\n")
 
     try:
         prodotti = scrape_prodotti()
-        print(f"Trovati {len(prodotti)} prodotti.")
 
-        stato_vecchio = carica_stato_da_gist()
+        if not prodotti:
+            print("  [!] Nessun prodotto trovato, possibile errore di caricamento pagina.")
+            return
+
+        stato_vecchio = carica_stato()
 
         if not stato_vecchio:
-            print("Primo avvio: salvo stato iniziale. Le notifiche partiranno dal prossimo controllo.")
-            salva_stato_su_gist(prodotti)
+            print("  Primo avvio: salvo stato iniziale. Le notifiche partiranno dal prossimo controllo.")
+            salva_stato(prodotti)
         else:
             variazioni = confronta(prodotti, stato_vecchio)
             if variazioni:
-                print(f"{len(variazioni)} variazione/i rilevata/e!")
+                print(f"  ⚠️  {len(variazioni)} variazione/i rilevata/e!")
                 invia_notifiche(variazioni)
-                salva_stato_su_gist(prodotti)
+                salva_stato(prodotti)
             else:
-                print("Nessuna variazione.")
+                print("  Nessuna variazione rilevata.")
 
     except Exception as e:
-        print(f"[ERRORE] {e}")
+        print(f"  [ERRORE] {e}")
         raise
+
 
 if __name__ == "__main__":
     main()
