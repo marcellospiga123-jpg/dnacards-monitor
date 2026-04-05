@@ -10,7 +10,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import requests
-from playwright.sync_api import sync_playwright
 
 # ─── CONFIGURAZIONE ───────────────────────────────────────────────────────────
 
@@ -61,75 +60,55 @@ def salva_stato(prodotti):
         print(f"  [!] Errore salvataggio stato: {e}")
 
 # ─── SCRAPING ────────────────────────────────────────────────────────────────
-
 def scrape_prodotti():
     prodotti = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-    headless=True,
-    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-)
-        
-        page = browser.new_page()
-        page.set_extra_http_headers({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-        })
 
-        # Timeout aumentato a 60 secondi, attesa su domcontentloaded (più veloce)
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    r = requests.get(URL, headers=headers, timeout=20)
+    html = r.text
+
+    # Split veloce sui prodotti
+    blocchi = html.split('class="product"')
+
+    print(f"  Trovati {len(blocchi)-1} prodotti nella pagina.")
+
+    for blocco in blocchi[1:]:
         try:
-            page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        except Exception:
-            # Se ancora timeout, proviamo senza aspettare nulla
-            page.goto(URL, wait_until="commit", timeout=60000)
+            # Nome
+            nome = "N/D"
+            if 'woocommerce-loop-product__title' in blocco:
+                nome = blocco.split('woocommerce-loop-product__title">')[1].split("<")[0].strip()
 
-        # Aspetta che appaiano i prodotti
-        try:
-            page.wait_for_selector("li.product", timeout=15000)
-        except Exception:
-            print("  [!] Selettore prodotti non trovato, provo comunque...")
+            # Prezzo
+            prezzo = None
+            if 'amount">' in blocco:
+                prezzo = blocco.split('amount">')[1].split("<")[0].strip()
 
-        page.wait_for_timeout(3000)
+            # Disponibilità
+            in_stock = True
+            if "out-of-stock" in blocco or "disabled" in blocco:
+                in_stock = False
 
-        cards = page.query_selector_all("li.product")
-        print(f"  Trovati {len(cards)} prodotti nella pagina.")
+            # Link
+            link = URL
+            if 'href="' in blocco:
+                link = blocco.split('href="')[1].split('"')[0]
 
-        for card in cards:
-            try:
-                nome_el = card.query_selector(".woocommerce-loop-product__title")
-                nome = nome_el.inner_text().strip() if nome_el else "N/D"
+            prodotti.append({
+                "nome": nome,
+                "prezzo": prezzo,
+                "disponibile": in_stock,
+                "link": link,
+            })
 
-                prezzo = None
-                ins_el = card.query_selector("ins .amount")
-                if ins_el:
-                    prezzo = ins_el.inner_text().strip()
-                else:
-                    price_el = card.query_selector(".price .amount")
-                    if price_el:
-                        prezzo = price_el.inner_text().strip()
+        except Exception as e:
+            print(f"  [!] Errore parsing prodotto: {e}")
 
-                esaurito_el = card.query_selector(".out-of-stock, .soldout, .button.disabled")
-                in_stock = True
-                if esaurito_el:
-                    in_stock = False
-                else:
-                    add_btn = card.query_selector("a.add_to_cart_button, button.single_add_to_cart_button")
-                    if not add_btn:
-                        in_stock = False
-
-                link_el = card.query_selector("a.woocommerce-loop-product__link, a")
-                link = link_el.get_attribute("href") if link_el else URL
-
-                prodotti.append({
-                    "nome": nome,
-                    "prezzo": prezzo,
-                    "disponibile": in_stock,
-                    "link": link,
-                })
-            except Exception as e:
-                print(f"  [!] Errore su un prodotto: {e}")
-
-        browser.close()
     return prodotti
+
 
 # ─── CONFRONTO ───────────────────────────────────────────────────────────────
 
