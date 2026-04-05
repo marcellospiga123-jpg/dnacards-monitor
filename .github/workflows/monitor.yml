@@ -21,7 +21,7 @@ jobs:
       - name: Installa dipendenze
         run: |
           pip install playwright requests
-          playwright install --with-deps
+          
 
       - name: Debug (opzionale ma utile)
         run: ls -R
