@@ -1,6 +1,6 @@
 """
 DNA Cards - Monitor prezzi e disponibilità
-Versione GitHub Actions — gira una volta sola, stato salvato su GitHub Gist
+Versione FAST (senza Playwright)
 """
 
 import json
@@ -10,23 +10,26 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import requests
+from bs4 import BeautifulSoup
 
-# ─── CONFIGURAZIONE ───────────────────────────────────────────────────────────
+# ─── CONFIG ─────────────────────────────────────────
 
 URL = "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/"
 
-EMAIL_ATTIVA       = True
-EMAIL_MITTENTE     = os.environ.get("EMAIL_MITTENTE", "")
-EMAIL_PASSWORD     = os.environ.get("EMAIL_PASSWORD", "")
+EMAIL_ATTIVA = True
+EMAIL_MITTENTE = os.environ.get("EMAIL_MITTENTE", "")
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_DESTINATARIO = os.environ.get("EMAIL_DESTINATARIO", "")
-EMAIL_SMTP         = "smtp.gmail.com"
-EMAIL_PORT         = 587
 
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
-GIST_ID    = os.environ.get("GIST_ID", "")
-GIST_FILE  = "dnacards_stato.json"
+GIST_ID = os.environ.get("GIST_ID", "")
+GIST_FILE = "dnacards_stato.json"
 
-# ─── STATO SU GIST ───────────────────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+# ─── GIST ───────────────────────────────────────────
 
 def carica_stato():
     if not GIST_ID or not GIST_TOKEN:
@@ -41,200 +44,167 @@ def carica_stato():
             content = r.json()["files"].get(GIST_FILE, {}).get("content", "{}")
             return json.loads(content)
     except Exception as e:
-        print(f"  [!] Errore caricamento stato: {e}")
+        print(f"[!] Errore caricamento stato: {e}")
     return {}
 
 def salva_stato(prodotti):
     if not GIST_ID or not GIST_TOKEN:
         return
-    stato = {p["nome"]: {"prezzo": p["prezzo"], "disponibile": p["disponibile"]} for p in prodotti}
+    stato = {
+        p["nome"]: {
+            "prezzo": p["prezzo"],
+            "disponibile": p["disponibile"]
+        }
+        for p in prodotti
+    }
     try:
         requests.patch(
             f"https://api.github.com/gists/{GIST_ID}",
             headers={"Authorization": f"token {GIST_TOKEN}"},
-            json={"files": {GIST_FILE: {"content": json.dumps(stato, ensure_ascii=False, indent=2)}}},
+            json={
+                "files": {
+                    GIST_FILE: {
+                        "content": json.dumps(stato, ensure_ascii=False, indent=2)
+                    }
+                }
+            },
             timeout=10,
         )
-        print("  Stato salvato su Gist.")
+        print("✔ Stato salvato su Gist")
     except Exception as e:
-        print(f"  [!] Errore salvataggio stato: {e}")
+        print(f"[!] Errore salvataggio stato: {e}")
 
-# ─── SCRAPING ────────────────────────────────────────────────────────────────
+# ─── SCRAPING FAST ──────────────────────────────────
+
 def scrape_prodotti():
+    try:
+        r = requests.get(URL, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[!] Errore richiesta: {e}")
+        return []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
     prodotti = []
+    cards = soup.select("li.product")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    print(f"Trovati {len(cards)} prodotti")
 
-    r = requests.get(URL, headers=headers, timeout=20)
-    html = r.text
-
-    # Split veloce sui prodotti
-    blocchi = html.split('class="product"')
-
-    print(f"  Trovati {len(blocchi)-1} prodotti nella pagina.")
-
-    for blocco in blocchi[1:]:
+    for card in cards:
         try:
-            # Nome
-            nome = "N/D"
-            if 'woocommerce-loop-product__title' in blocco:
-                nome = blocco.split('woocommerce-loop-product__title">')[1].split("<")[0].strip()
+            nome_el = card.select_one(".woocommerce-loop-product__title")
+            nome = nome_el.text.strip() if nome_el else "N/D"
 
-            # Prezzo
-            prezzo = None
-            if 'amount">' in blocco:
-                prezzo = blocco.split('amount">')[1].split("<")[0].strip()
+            prezzo_el = card.select_one("ins .amount") or card.select_one(".price .amount")
+            prezzo = prezzo_el.text.strip() if prezzo_el else None
 
-            # Disponibilità
-            in_stock = True
-            if "out-of-stock" in blocco or "disabled" in blocco:
-                in_stock = False
+            # stock
+            out = card.select_one(".out-of-stock, .soldout, .button.disabled")
+            disponibile = not bool(out)
 
-            # Link
-            link = URL
-            if 'href="' in blocco:
-                link = blocco.split('href="')[1].split('"')[0]
+            link_el = card.select_one("a")
+            link = link_el["href"] if link_el else URL
 
             prodotti.append({
                 "nome": nome,
                 "prezzo": prezzo,
-                "disponibile": in_stock,
+                "disponibile": disponibile,
                 "link": link,
             })
 
         except Exception as e:
-            print(f"  [!] Errore parsing prodotto: {e}")
+            print(f"[!] Errore prodotto: {e}")
 
     return prodotti
 
+# ─── LOGICA ─────────────────────────────────────────
 
-# ─── CONFRONTO ───────────────────────────────────────────────────────────────
-
-def confronta(prodotti_nuovi, stato_vecchio):
+def confronta(nuovi, vecchi):
     variazioni = []
-    for p in prodotti_nuovi:
-        nome = p["nome"]
-        vecchio = stato_vecchio.get(nome)
 
-        if vecchio is None:
-            variazioni.append({
-                "tipo": "nuovo",
-                "nome": nome,
-                "prezzo": p["prezzo"],
-                "disponibile": p["disponibile"],
-                "link": p["link"],
-            })
+    for p in nuovi:
+        nome = p["nome"]
+        vecchio = vecchi.get(nome)
+
+        if not vecchio:
+            variazioni.append({"tipo": "nuovo", **p})
             continue
 
         if vecchio["prezzo"] != p["prezzo"]:
             variazioni.append({
                 "tipo": "prezzo",
                 "nome": nome,
-                "prezzo_vecchio": vecchio["prezzo"],
-                "prezzo_nuovo": p["prezzo"],
-                "disponibile": p["disponibile"],
+                "vecchio": vecchio["prezzo"],
+                "nuovo": p["prezzo"],
                 "link": p["link"],
             })
 
         if vecchio["disponibile"] != p["disponibile"]:
-            tipo = "tornato_disponibile" if p["disponibile"] else "esaurito"
             variazioni.append({
-                "tipo": tipo,
+                "tipo": "stock",
                 "nome": nome,
-                "prezzo": p["prezzo"],
+                "disponibile": p["disponibile"],
                 "link": p["link"],
             })
 
     return variazioni
 
-# ─── NOTIFICHE ───────────────────────────────────────────────────────────────
-
-def formatta_messaggio(variazioni):
-    righe = [f"🔔 DNA Cards — {len(variazioni)} variazione/i rilevata/e\n"]
-    for v in variazioni:
-        if v["tipo"] == "prezzo":
-            righe.append(
-                f"💰 PREZZO CAMBIATO: {v['nome']}\n"
-                f"   {v['prezzo_vecchio']} → {v['prezzo_nuovo']}\n"
-                f"   {v['link']}"
-            )
-        elif v["tipo"] == "esaurito":
-            righe.append(
-                f"❌ ESAURITO: {v['nome']}\n"
-                f"   Prezzo: {v.get('prezzo', 'N/D')}\n"
-                f"   {v['link']}"
-            )
-        elif v["tipo"] == "tornato_disponibile":
-            righe.append(
-                f"✅ TORNATO DISPONIBILE: {v['nome']}\n"
-                f"   Prezzo: {v.get('prezzo', 'N/D')}\n"
-                f"   {v['link']}"
-            )
-        elif v["tipo"] == "nuovo":
-            stato = "Disponibile" if v["disponibile"] else "Esaurito"
-            righe.append(
-                f"🆕 NUOVO PRODOTTO: {v['nome']}\n"
-                f"   Prezzo: {v.get('prezzo', 'N/D')} — {stato}\n"
-                f"   {v['link']}"
-            )
-    return "\n\n".join(righe)
+# ─── EMAIL ──────────────────────────────────────────
 
 def invia_email(testo):
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "DNA Cards — Variazione prezzo/disponibilità"
+        msg = MIMEMultipart()
+        msg["Subject"] = "DNA Cards Alert"
         msg["From"] = EMAIL_MITTENTE
         msg["To"] = EMAIL_DESTINATARIO
-        msg.attach(MIMEText(testo, "plain", "utf-8"))
-        with smtplib.SMTP(EMAIL_SMTP, EMAIL_PORT) as server:
+
+        msg.attach(MIMEText(testo, "plain"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(EMAIL_MITTENTE, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_MITTENTE, EMAIL_DESTINATARIO, msg.as_string())
-        print("  ✉️  Email inviata.")
+            server.send_message(msg)
+
+        print("✉️ Email inviata")
+
     except Exception as e:
-        print(f"  [!] Errore email: {e}")
+        print(f"[!] Errore email: {e}")
 
-def invia_notifiche(variazioni):
-    if not variazioni:
-        return
-    testo = formatta_messaggio(variazioni)
-    print(testo)
-    if EMAIL_ATTIVA:
-        invia_email(testo)
-
-# ─── MAIN ────────────────────────────────────────────────────────────────────
+# ─── MAIN ───────────────────────────────────────────
 
 def main():
-    print("🤖 DNA Cards Monitor — controllo in corso...")
-    print(f"   URL: {URL}\n")
+    print("🚀 Monitor veloce avviato...\n")
 
-    try:
-        prodotti = scrape_prodotti()
+    prodotti = scrape_prodotti()
 
-        if not prodotti:
-            print("  [!] Nessun prodotto trovato, possibile errore di caricamento pagina.")
-            return
+    if not prodotti:
+        print("[!] Nessun prodotto trovato")
+        return
 
-        stato_vecchio = carica_stato()
+    stato_vecchio = carica_stato()
 
-        if not stato_vecchio:
-            print("  Primo avvio: salvo stato iniziale. Le notifiche partiranno dal prossimo controllo.")
-            salva_stato(prodotti)
-        else:
-            variazioni = confronta(prodotti, stato_vecchio)
-            if variazioni:
-                print(f"  ⚠️  {len(variazioni)} variazione/i rilevata/e!")
-                invia_notifiche(variazioni)
-                salva_stato(prodotti)
-            else:
-                print("  Nessuna variazione rilevata.")
+    if not stato_vecchio:
+        print("Primo avvio → salvo stato")
+        salva_stato(prodotti)
+        return
 
-    except Exception as e:
-        print(f"  [ERRORE] {e}")
-        raise
+    variazioni = confronta(prodotti, stato_vecchio)
 
+    if variazioni:
+        print(f"⚠️ {len(variazioni)} variazioni")
+
+        testo = json.dumps(variazioni, indent=2, ensure_ascii=False)
+        print(testo)
+
+        if EMAIL_ATTIVA:
+            invia_email(testo)
+
+        salva_stato(prodotti)
+    else:
+        print("✔ Nessuna variazione")
+
+# ─── RUN ────────────────────────────────────────────
 
 if __name__ == "__main__":
     main()
