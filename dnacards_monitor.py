@@ -1,9 +1,3 @@
-"""
-DNA Cards Monitor PRO
-Monitora EN + JP + Bustine singole
-Versione veloce (no Playwright)
-"""
-
 import json
 import os
 import smtplib
@@ -13,7 +7,7 @@ from email.mime.text import MIMEText
 import requests
 from bs4 import BeautifulSoup
 
-# ─── URL MULTIPLI ───────────────────────────────────
+# ─── URL ─────────────────────────────────────────────────────────────
 
 URLS = [
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
@@ -21,22 +15,25 @@ URLS = [
     "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
 ]
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+# ─── EMAIL ───────────────────────────────────────────────────────────
 
-# ─── EMAIL ─────────────────────────────────────────
-
-EMAIL_ATTIVA = True
-EMAIL_MITTENTE = os.environ.get("EMAIL_MITTENTE", "")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
+EMAIL_ATTIVA       = True
+EMAIL_MITTENTE     = os.environ.get("EMAIL_MITTENTE", "")
+EMAIL_PASSWORD     = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_DESTINATARIO = os.environ.get("EMAIL_DESTINATARIO", "")
 
-# ─── GIST ───────────────────────────────────────────
+# ─── TELEGRAM ────────────────────────────────────────────────────────
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ─── GIST ────────────────────────────────────────────────────────────
 
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
-GIST_ID = os.environ.get("GIST_ID", "")
-GIST_FILE = "dnacards_stato.json"
+GIST_ID    = os.environ.get("GIST_ID", "")
+GIST_FILE  = "dnacards_stato.json"
 
-# ─── GIST FUNZIONI ──────────────────────────────────
+# ─── STATO ───────────────────────────────────────────────────────────
 
 def carica_stato():
     if not GIST_ID or not GIST_TOKEN:
@@ -45,129 +42,126 @@ def carica_stato():
         r = requests.get(
             f"https://api.github.com/gists/{GIST_ID}",
             headers={"Authorization": f"token {GIST_TOKEN}"},
-            timeout=10,
         )
         if r.ok:
             content = r.json()["files"].get(GIST_FILE, {}).get("content", "{}")
             return json.loads(content)
-    except Exception as e:
-        print(f"[!] Errore caricamento stato: {e}")
+    except:
+        pass
     return {}
 
 def salva_stato(prodotti):
     if not GIST_ID or not GIST_TOKEN:
         return
-    stato = {
-        p["nome"]: {
-            "prezzo": p["prezzo"],
-            "disponibile": p["disponibile"]
-        }
-        for p in prodotti
-    }
-    try:
-        requests.patch(
-            f"https://api.github.com/gists/{GIST_ID}",
-            headers={"Authorization": f"token {GIST_TOKEN}"},
-            json={
-                "files": {
-                    GIST_FILE: {
-                        "content": json.dumps(stato, ensure_ascii=False, indent=2)
-                    }
-                }
-            },
-            timeout=10,
-        )
-        print("✔ Stato salvato su Gist")
-    except Exception as e:
-        print(f"[!] Errore salvataggio stato: {e}")
+    stato = {p["nome"]: {"prezzo": p["prezzo"], "disponibile": p["disponibile"]} for p in prodotti}
+    requests.patch(
+        f"https://api.github.com/gists/{GIST_ID}",
+        headers={"Authorization": f"token {GIST_TOKEN}"},
+        json={"files": {GIST_FILE: {"content": json.dumps(stato, indent=2)}}},
+    )
 
-# ─── SCRAPING MULTI PAGINA ──────────────────────────
+# ─── SCRAPING VELOCE ────────────────────────────────────────────────
 
-def scrape_prodotti():
+def scrape():
     prodotti = []
 
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
     for url in URLS:
-        print(f"\n🔎 Controllo: {url}")
+        print(f"Controllo: {url}")
 
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            r.raise_for_status()
-        except Exception as e:
-            print(f"[!] Errore richiesta: {e}")
-            continue
-
+        r = requests.get(url, headers=headers, timeout=20)
         soup = BeautifulSoup(r.text, "html.parser")
-        cards = soup.select("li.product")
 
-        print(f"Trovati {len(cards)} prodotti")
+        cards = soup.select("li.product")
 
         for card in cards:
             try:
-                nome_el = card.select_one(".woocommerce-loop-product__title")
-                nome = nome_el.text.strip() if nome_el else "N/D"
+                nome = card.select_one(".woocommerce-loop-product__title")
+                nome = nome.text.strip() if nome else "N/D"
 
-                # aggiungo tag pagina per distinguere
-                nome = f"[{url.split('/')[-2]}] {nome}"
+                prezzo = card.select_one(".price .amount")
+                prezzo = prezzo.text.strip() if prezzo else "N/D"
 
-                prezzo_el = card.select_one("ins .amount") or card.select_one(".price .amount")
-                prezzo = prezzo_el.text.strip() if prezzo_el else None
+                disponibile = not card.select_one(".out-of-stock")
 
-                out = card.select_one(".out-of-stock, .soldout, .button.disabled")
-                disponibile = not bool(out)
-
-                link_el = card.select_one("a")
-                link = link_el["href"] if link_el else url
+                link = card.select_one("a")["href"]
 
                 prodotti.append({
                     "nome": nome,
                     "prezzo": prezzo,
                     "disponibile": disponibile,
-                    "link": link,
+                    "link": link
                 })
-
-            except Exception as e:
-                print(f"[!] Errore prodotto: {e}")
+            except:
+                pass
 
     return prodotti
 
-# ─── LOGICA ─────────────────────────────────────────
+# ─── CONFRONTO ──────────────────────────────────────────────────────
 
 def confronta(nuovi, vecchi):
     variazioni = []
 
     for p in nuovi:
         nome = p["nome"]
-        vecchio = vecchi.get(nome)
+        old = vecchi.get(nome)
 
-        if not vecchio:
+        if not old:
             variazioni.append({"tipo": "nuovo", **p})
             continue
 
-        if vecchio["prezzo"] != p["prezzo"]:
+        if old["prezzo"] != p["prezzo"]:
             variazioni.append({
                 "tipo": "prezzo",
                 "nome": nome,
-                "vecchio": vecchio["prezzo"],
+                "vecchio": old["prezzo"],
                 "nuovo": p["prezzo"],
-                "link": p["link"],
+                "link": p["link"]
             })
 
-        if vecchio["disponibile"] != p["disponibile"]:
+        if old["disponibile"] != p["disponibile"]:
             variazioni.append({
                 "tipo": "stock",
                 "nome": nome,
                 "disponibile": p["disponibile"],
-                "link": p["link"],
+                "link": p["link"]
             })
 
     return variazioni
 
-# ─── EMAIL ──────────────────────────────────────────
+# ─── FORMAT (BONUS BELLO 🔥) ─────────────────────────────────────────
+
+def formatta(variazioni):
+    testo = "🔔 DNA Cards Alert\n\n"
+
+    for v in variazioni:
+        if v["tipo"] == "prezzo":
+            testo += f"💰 PREZZO: {v['nome']}\n"
+            testo += f"{v['vecchio']} → {v['nuovo']}\n"
+            testo += f"{v['link']}\n\n"
+
+        elif v["tipo"] == "stock":
+            stato = "✅ Disponibile" if v["disponibile"] else "❌ Esaurito"
+            testo += f"📦 STOCK: {v['nome']}\n"
+            testo += f"{stato}\n"
+            testo += f"{v['link']}\n\n"
+
+        elif v["tipo"] == "nuovo":
+            testo += f"🆕 NUOVO: {v['nome']}\n"
+            testo += f"{v.get('prezzo', 'N/D')}\n"
+            testo += f"{v['link']}\n\n"
+
+    return testo
+
+# ─── EMAIL ──────────────────────────────────────────────────────────
 
 def invia_email(testo):
     try:
         msg = MIMEMultipart()
-        msg["Subject"] = "DNA Cards Alert"
+        msg["Subject"] = "DNA Cards Update"
         msg["From"] = EMAIL_MITTENTE
         msg["To"] = EMAIL_DESTINATARIO
 
@@ -176,47 +170,55 @@ def invia_email(testo):
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(EMAIL_MITTENTE, EMAIL_PASSWORD)
-            server.send_message(msg)
+            server.sendmail(EMAIL_MITTENTE, EMAIL_DESTINATARIO, msg.as_string())
 
-        print("✉️ Email inviata")
-
+        print("Email inviata")
     except Exception as e:
-        print(f"[!] Errore email: {e}")
+        print("Errore email:", e)
 
-# ─── MAIN ───────────────────────────────────────────
+# ─── TELEGRAM ───────────────────────────────────────────────────────
+
+def invia_telegram(testo):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": testo,
+                "parse_mode": "HTML"
+            },
+            timeout=10
+        )
+        print("Telegram inviato")
+    except Exception as e:
+        print("Errore telegram:", e)
+
+# ─── MAIN ───────────────────────────────────────────────────────────
 
 def main():
-    print("🚀 Monitor PRO avviato...\n")
+    print("Controllo...")
 
-    prodotti = scrape_prodotti()
+    prodotti = scrape()
+    stato = carica_stato()
 
-    if not prodotti:
-        print("[!] Nessun prodotto trovato")
-        return
-
-    stato_vecchio = carica_stato()
-
-    if not stato_vecchio:
-        print("Primo avvio → salvo stato")
+    if not stato:
         salva_stato(prodotti)
+        print("Primo avvio")
         return
 
-    variazioni = confronta(prodotti, stato_vecchio)
+    var = confronta(prodotti, stato)
 
-    if variazioni:
-        print(f"⚠️ {len(variazioni)} variazioni")
-
-        testo = json.dumps(variazioni, indent=2, ensure_ascii=False)
-        print(testo)
-
-        if EMAIL_ATTIVA:
-            invia_email(testo)
-
+    if var:
+        msg = formatta(var)
+        print(msg)
+        invia_email(msg)
+        invia_telegram(msg)
         salva_stato(prodotti)
     else:
-        print("✔ Nessuna variazione")
-
-# ─── RUN ────────────────────────────────────────────
+        print("Nessuna variazione")
 
 if __name__ == "__main__":
     main()
