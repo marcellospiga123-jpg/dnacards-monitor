@@ -2,10 +2,10 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import os
-import base64
 from datetime import datetime
 import matplotlib.pyplot as plt
 import statistics
+import base64
 
 # ─── CONFIG ─────────────────────────────
 
@@ -18,11 +18,10 @@ URLS = {
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-GITHUB_TOKEN = "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"
-REPO = "marcello123/dna-dashboard"
-FILE_PATH = "storico.json"
+GITHUB_TOKEN = os.environ.get("GH_TOKEN")
+REPO = os.environ.get("REPO")
 
-ALERT_FILE = "alert.json"
+FILE_NAME = "storico.json"
 
 PROFIT_MIN = 20
 ROI_MIN = 0.25
@@ -33,7 +32,6 @@ CONFIDENCE_MIN = 60
 def send_msg(text):
     if not TELEGRAM_TOKEN:
         return
-
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         data={"chat_id": TELEGRAM_CHAT_ID, "text": text}
@@ -42,47 +40,43 @@ def send_msg(text):
 def send_photo(path):
     if not TELEGRAM_TOKEN:
         return
-
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
         files={"photo": open(path, "rb")},
         data={"chat_id": TELEGRAM_CHAT_ID}
     )
 
-# ─── FILE ───────────────────────────────
-
-def load(name):
-    if os.path.exists(name):
-        with open(name) as f:
-            return json.load(f)
-    return {}
-
-def save(name, data):
-    with open(name, "w") as f:
-        json.dump(data, f, indent=2)
-
-# ─── GITHUB ─────────────────────────────
+# ─── GITHUB STORAGE ─────────────────────
 
 def load_github():
-    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
-    r = requests.get(url, headers={"Authorization": f"token {GITHUB_TOKEN}"}).json()
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
-    content = base64.b64decode(r["content"]).decode()
-    return json.loads(content), r["sha"]
+    r = requests.get(url, headers=headers)
 
-def upload_github(data, sha):
-    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
+    if r.status_code == 200:
+        data = r.json()
+        content = base64.b64decode(data["content"]).decode()
+        return json.loads(content), data["sha"]
+    
+    # file non esiste ancora
+    return {}, None
+
+def save_github(data, sha):
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
     content = base64.b64encode(json.dumps(data, indent=2).encode()).decode()
 
-    requests.put(url,
-        headers={"Authorization": f"token {GITHUB_TOKEN}"},
-        json={
-            "message": "update storico prezzi",
-            "content": content,
-            "sha": sha
-        }
-    )
+    payload = {
+        "message": "update storico",
+        "content": content
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    requests.put(url, headers=headers, json=payload)
 
 # ─── UTILS ──────────────────────────────
 
@@ -138,7 +132,7 @@ def update(storico, prodotti):
 
 # ─── ANALISI ────────────────────────────
 
-def analisi(prodotti, storico, alerts):
+def analisi(prodotti, storico):
     segnali = []
 
     for nome, varianti in prodotti.items():
@@ -171,25 +165,18 @@ def analisi(prodotti, storico, alerts):
         if vol < avg * 0.2: score += 20
 
         if profitto >= PROFIT_MIN and score >= CONFIDENCE_MIN:
-            key = f"Q_{nome}"
+            msg = (
+                f"🚨 QUANT TRADE\n\n"
+                f"{nome}\n\n"
+                f"🏪 Prezzo: {best_price}€ ({best['sito']})\n"
+                f"📈 Target: {round(max_p,2)}€\n"
+                f"💸 Profitto: {round(profitto,2)}€\n"
+                f"📊 ROI: {round(roi*100,1)}%\n"
+                f"⚡ Score: {score}/100\n\n"
+                f"{best['link']}"
+            )
 
-            if key not in alerts:
-                qty = int(100 / best_price) if best_price else 1
-
-                msg = (
-                    f"🚨 QUANT TRADE\n\n"
-                    f"{nome}\n\n"
-                    f"🏪 Miglior prezzo: {best_price}€ ({best['sito']})\n"
-                    f"📈 Target: {round(max_p,2)}€\n"
-                    f"💸 Profitto/unità: {round(profitto,2)}€\n"
-                    f"📊 ROI: {round(roi*100,1)}%\n"
-                    f"⚡ Score: {score}/100\n\n"
-                    f"🧠 Compra ~{qty} pezzi\n\n"
-                    f"{best['link']}"
-                )
-
-                segnali.append(msg)
-                alerts[key] = True
+            segnali.append(msg)
 
     return segnali
 
@@ -201,7 +188,7 @@ def grafico(storico):
     for nome, dati in list(storico.items())[:5]:
         prezzi = [p_float(d["p"]) for d in dati if p_float(d["p"])]
         if len(prezzi) > 1:
-            plt.plot(prezzi, label=nome[:12])
+            plt.plot(prezzi, label=nome[:10])
 
     if not plt.gca().has_data():
         return None
@@ -216,16 +203,12 @@ def grafico(storico):
 # ─── MAIN ───────────────────────────────
 
 def main():
-    alerts = load(ALERT_FILE)
-
-    prodotti = scrape()
-
-    # 🔥 prende storico da GitHub
     storico, sha = load_github()
 
+    prodotti = scrape()
     storico = update(storico, prodotti)
 
-    segnali = analisi(prodotti, storico, alerts)
+    segnali = analisi(prodotti, storico)
 
     for s in segnali:
         send_msg(s)
@@ -235,10 +218,7 @@ def main():
         if g:
             send_photo(g)
 
-    save(ALERT_FILE, alerts)
-
-    # 🔥 salva su GitHub
-    upload_github(storico, sha)
+    save_github(storico, sha)
 
 if __name__ == "__main__":
     main()
