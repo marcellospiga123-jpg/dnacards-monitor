@@ -16,85 +16,78 @@ URLS = [
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-STATO_FILE = "stato.json"
+PREZZO_TARGET = 80
+DROP_FORTE = 0.85  # -15%
+
 STORICO_FILE = "storico.json"
+ALERT_FILE = "alert.json"
 
 # ─── TELEGRAM ───────────────────────────
 
-def invia_telegram(testo):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram non configurato")
-        return
+def send_msg(text):
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    )
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    requests.post(url, data={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": testo
-    })
-
-def invia_foto(path, caption="📊 Grafico prezzi"):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-
+def send_photo(path):
     with open(path, "rb") as f:
-        requests.post(url, files={"photo": f}, data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "caption": caption
-        })
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+            files={"photo": f},
+            data={"chat_id": TELEGRAM_CHAT_ID}
+        )
 
 # ─── FILE ───────────────────────────────
 
-def carica(nome):
-    if os.path.exists(nome):
-        with open(nome, "r", encoding="utf-8") as f:
+def load(name):
+    if os.path.exists(name):
+        with open(name, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-def salva(nome, dati):
-    with open(nome, "w", encoding="utf-8") as f:
-        json.dump(dati, f, indent=2, ensure_ascii=False)
+def save(name, data):
+    with open(name, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-# ─── SCRAPING ───────────────────────────
+# ─── UTILS ──────────────────────────────
+
+def p_float(p):
+    try:
+        return float(p.replace("€","").replace(",","."))
+    except:
+        return None
+
+# ─── SCRAPE ─────────────────────────────
 
 def scrape():
     prodotti = []
 
     for url in URLS:
-        try:
-            r = requests.get(url, timeout=15)
-            soup = BeautifulSoup(r.text, "html.parser")
+        r = requests.get(url, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-            cards = soup.select("li.product")
+        for c in soup.select("li.product"):
+            nome = c.select_one(".woocommerce-loop-product__title")
+            prezzo = c.select_one(".price .amount")
 
-            for c in cards:
-                nome = c.select_one(".woocommerce-loop-product__title")
-                prezzo = c.select_one(".price .amount")
+            nome = nome.text.strip() if nome else "N/D"
+            prezzo = prezzo.text.strip() if prezzo else "0"
 
-                nome = nome.text.strip() if nome else "N/D"
-                prezzo = prezzo.text.strip() if prezzo else "0"
+            link = c.select_one("a")["href"]
 
-                disponibile = not bool(c.select_one(".out-of-stock"))
-
-                link = c.select_one("a")
-                link = link["href"] if link else url
-
-                prodotti.append({
-                    "nome": nome,
-                    "prezzo": prezzo,
-                    "disponibile": disponibile,
-                    "link": link,
-                    "sito": url
-                })
-
-        except Exception as e:
-            print("Errore:", e)
+            prodotti.append({
+                "nome": nome,
+                "prezzo": prezzo,
+                "link": link
+            })
 
     return prodotti
 
 # ─── STORICO ────────────────────────────
 
-def aggiorna_storico(storico, prodotti):
-    now = datetime.now().strftime("%d/%m %H:%M")
+def update_history(storico, prodotti):
+    now = datetime.now().strftime("%H:%M")
 
     for p in prodotti:
         nome = p["nome"]
@@ -103,145 +96,83 @@ def aggiorna_storico(storico, prodotti):
             storico[nome] = []
 
         storico[nome].append({
-            "data": now,
-            "prezzo": p["prezzo"]
+            "t": now,
+            "p": p["prezzo"]
         })
 
     return storico
 
-# ─── CONFRONTO ──────────────────────────
+# ─── ANALISI INTELLIGENTE ───────────────
 
-def confronta(nuovi, vecchi):
-    variazioni = []
-
-    for p in nuovi:
-        nome = p["nome"]
-        old = vecchi.get(nome)
-
-        if not old:
-            variazioni.append({"tipo": "NUOVO", "nome": nome, "prezzo": p["prezzo"], "link": p["link"]})
-            continue
-
-        if old["prezzo"] != p["prezzo"]:
-            variazioni.append({"tipo": "PREZZO", "nome": nome, "nuovo": p["prezzo"], "link": p["link"]})
-
-        if old["disponibile"] != p["disponibile"]:
-            tipo = "DISPONIBILE" if p["disponibile"] else "ESAURITO"
-            variazioni.append({"tipo": tipo, "nome": nome, "prezzo": p["prezzo"], "link": p["link"]})
-
-    return variazioni
-
-# ─── FORMAT ─────────────────────────────
-
-def formatta(variazioni):
-    testo = "🔔 DNA Cards Alert\n\n"
-
-    for v in variazioni:
-        testo += f"{v['tipo']}: {v['nome']}\n"
-        testo += f"{v.get('nuovo', v.get('prezzo', ''))}\n"
-        testo += f"{v['link']}\n\n"
-
-    return testo
-
-# ─── SCONTI ─────────────────────────────
-
-def trova_sconti(storico):
-    msg = []
-
-    for nome, dati in storico.items():
-        if len(dati) < 2:
-            continue
-
-        try:
-            p1 = float(dati[-2]["prezzo"].replace("€","").replace(",","."))
-            p2 = float(dati[-1]["prezzo"].replace("€","").replace(",","."))
-
-            if p2 < p1:
-                msg.append(f"📉 SCONTO: {nome}\n{p1}€ → {p2}€")
-        except:
-            continue
-
-    return msg
-
-# ─── MINIMO STORICO ─────────────────────
-
-def minimo_storico(storico):
-    msg = []
-
-    for nome, dati in storico.items():
-        prezzi = []
-
-        for d in dati:
-            try:
-                prezzi.append(float(d["prezzo"].replace("€","").replace(",",".")))
-            except:
-                continue
-
-        if len(prezzi) < 2:
-            continue
-
-        if prezzi[-1] == min(prezzi):
-            msg.append(f"🔥 PREZZO MINIMO: {nome}\n{prezzi[-1]}€")
-
-    return msg
-
-# ─── CONFRONTO SITI ─────────────────────
-
-def confronto_siti(prodotti):
-    best = {}
+def analyze(prodotti, storico, alerts):
+    msgs = []
 
     for p in prodotti:
         nome = p["nome"]
+        prezzo = p_float(p["prezzo"])
 
-        try:
-            prezzo = float(p["prezzo"].replace("€","").replace(",","."))
-        except:
+        if not prezzo:
             continue
 
-        if nome not in best or prezzo < best[nome]["prezzo"]:
-            best[nome] = {"prezzo": prezzo, "link": p["link"]}
+        history = storico.get(nome, [])
+        prezzi = [p_float(d["p"]) for d in history if p_float(d["p"])]
 
-    msg = []
-    for nome, d in best.items():
-        msg.append(f"🏆 MIGLIOR PREZZO: {nome}\n{d['prezzo']}€\n{d['link']}")
+        # TARGET
+        if prezzo <= PREZZO_TARGET:
+            key = f"T_{nome}"
+            if key not in alerts:
+                msgs.append(f"🎯 TARGET\n{nome}\n{prezzo}€\n{p['link']}")
+                alerts[key] = True
 
-    return msg[:3]
+        # MINIMO STORICO
+        if len(prezzi) > 2 and prezzo == min(prezzi):
+            key = f"M_{nome}"
+            if key not in alerts:
+                msgs.append(f"🔥 MINIMO STORICO\n{nome}\n{prezzo}€")
+                alerts[key] = True
 
-# ─── GRAFICO PRO ────────────────────────
+        # CALO FORTE
+        if len(prezzi) > 1 and prezzi[-1] < prezzi[-2] * DROP_FORTE:
+            key = f"D_{nome}"
+            if key not in alerts:
+                msgs.append(f"📉 CROLLO\n{nome}\n{prezzo}€")
+                alerts[key] = True
 
-def grafico_pro(storico):
-    plt.figure(figsize=(10,5))
+        # BEST DEAL (combo)
+        if len(prezzi) > 3:
+            avg = sum(prezzi[:-1]) / (len(prezzi)-1)
+            if prezzo < avg * 0.8:
+                key = f"B_{nome}"
+                if key not in alerts:
+                    msgs.append(f"💸 BEST DEAL\n{nome}\n{prezzo}€")
+                    alerts[key] = True
 
-    count = 0
+    return msgs
 
+# ─── GRAFICO ────────────────────────────
+
+def make_graph(storico):
+    plt.figure()
+
+    i = 0
     for nome, dati in storico.items():
-        if count >= 3:
+        if i >= 3:
             break
 
         prezzi = []
-        date = []
-
         for d in dati[-10:]:
-            try:
-                prezzi.append(float(d["prezzo"].replace("€","").replace(",",".")))
-                date.append(d["data"])
-            except:
-                continue
+            pf = p_float(d["p"])
+            if pf:
+                prezzi.append(pf)
 
-        if len(prezzi) < 2:
-            continue
+        if len(prezzi) > 1:
+            plt.plot(prezzi, label=nome[:15])
+            i += 1
 
-        plt.plot(date, prezzi, marker='o', label=nome[:20])
-        count += 1
-
-    if count == 0:
+    if i == 0:
         return None
 
-    plt.xticks(rotation=45)
-    plt.title("📊 Andamento Prezzi")
     plt.legend()
-    plt.tight_layout()
-
     file = "grafico.png"
     plt.savefig(file)
     plt.close()
@@ -251,48 +182,26 @@ def grafico_pro(storico):
 # ─── MAIN ───────────────────────────────
 
 def main():
-    print("START BOT")
+    send_msg("🤖 BOT FINAL BOSS ONLINE")
 
-    invia_telegram("✅ BOT ONLINE")
-
-    stato_vecchio = carica(STATO_FILE)
-    storico = carica(STORICO_FILE)
+    storico = load(STORICO_FILE)
+    alerts = load(ALERT_FILE)
 
     prodotti = scrape()
 
-    stato_nuovo = {
-        p["nome"]: {
-            "prezzo": p["prezzo"],
-            "disponibile": p["disponibile"]
-        } for p in prodotti
-    }
+    storico = update_history(storico, prodotti)
 
-    variazioni = confronta(prodotti, stato_vecchio)
+    msgs = analyze(prodotti, storico, alerts)
 
-    if variazioni:
-        invia_telegram(formatta(variazioni))
+    for m in msgs:
+        send_msg(m)
 
-    storico = aggiorna_storico(storico, prodotti)
-
-    # ALERT EXTRA
-    for msg in trova_sconti(storico):
-        invia_telegram(msg)
-
-    for msg in minimo_storico(storico):
-        invia_telegram(msg)
-
-    for msg in confronto_siti(prodotti):
-        invia_telegram(msg)
-
-    # GRAFICO
-    g = grafico_pro(storico)
+    g = make_graph(storico)
     if g:
-        invia_foto(g)
+        send_photo(g)
 
-    salva(STATO_FILE, stato_nuovo)
-    salva(STORICO_FILE, storico)
-
-    print("END")
+    save(STORICO_FILE, storico)
+    save(ALERT_FILE, alerts)
 
 # ─── RUN ────────────────────────────────
 
