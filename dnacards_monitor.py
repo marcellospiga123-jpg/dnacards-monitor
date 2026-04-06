@@ -16,8 +16,9 @@ URLS = [
 
 STORICO_FILE = "storico.json"
 MESSAGES_FILE = "messages.json"
+HEARTBEAT_FILE = "heartbeat.json"
 
-# ===== LOAD FILES =====
+# ===== UTIL =====
 def load_json(file):
     if not os.path.exists(file):
         return {}
@@ -30,84 +31,126 @@ def save_json(file, data):
 
 storico = load_json(STORICO_FILE)
 messages = load_json(MESSAGES_FILE)
+heartbeat = load_json(HEARTBEAT_FILE)
 
 # ===== TELEGRAM =====
-def send_telegram(text, link):
+def send_telegram(text, link=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "🛒 Compra ora", "url": link}]
-        ]
+    payload = {
+        "chat_id": None,
+        "text": text,
+        "parse_mode": "HTML"
     }
 
+    if link:
+        payload["reply_markup"] = {
+            "inline_keyboard": [
+                [{"text": "🛒 Compra ora", "url": link}]
+            ]
+        }
+
     for chat_id in CHAT_IDS:
-        requests.post(url, json={
-            "chat_id": chat_id,
-            "text": text,
-            "reply_markup": keyboard,
-            "parse_mode": "HTML"
-        })
+        payload["chat_id"] = chat_id
+        requests.post(url, json=payload)
 
 # ===== SCRAPER =====
 def get_products():
     prodotti = []
 
     for url in URLS:
-        r = requests.get(url)
-        soup = BeautifulSoup(r.text, "html.parser")
+        try:
+            r = requests.get(url, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
 
-        cards = soup.select(".product")
+            cards = soup.select(".product")
 
-        for c in cards:
-            try:
-                name = c.select_one(".woocommerce-loop-product__title").text.strip()
-                price = c.select_one(".price").text.strip()
-                link = c.select_one("a")["href"]
+            for c in cards:
+                try:
+                    name = c.select_one(".woocommerce-loop-product__title").text.strip()
+                    price_raw = c.select_one(".price").text.strip()
+                    link = c.select_one("a")["href"]
 
-                disponibile = "Esaurito" not in c.text
+                    disponibile = "Esaurito" not in c.text
 
-                prodotti.append({
-                    "name": name,
-                    "price": price,
-                    "link": link,
-                    "available": disponibile
-                })
+                    prodotti.append({
+                        "name": name,
+                        "price_raw": price_raw,
+                        "link": link,
+                        "available": disponibile
+                    })
 
-            except:
-                continue
+                except:
+                    continue
+
+        except:
+            continue
 
     return prodotti
 
-# ===== ROI (semplice simulazione) =====
-def calcola_roi(prezzo):
+# ===== PARSE PREZZO =====
+def parse_price(price):
     try:
-        p = float(prezzo.replace("€", "").replace(",", "."))
-        roi = round((120 - p) / p * 100, 2)
-        return roi
+        return float(price.replace("€", "").replace(",", ".").split()[0])
     except:
         return 0
+
+# ===== ROI REALE =====
+def calcola_roi(nome, prezzo):
+    p = parse_price(prezzo)
+
+    # stima valore medio rivendita (logica migliorata)
+    if "OP-05" in nome or "OP05" in nome:
+        resale = 140
+    elif "OP-06" in nome:
+        resale = 130
+    elif "OP-07" in nome:
+        resale = 125
+    elif "PRB" in nome:
+        resale = 110
+    else:
+        resale = 115
+
+    if p == 0:
+        return 0
+
+    roi = ((resale - p) / p) * 100
+    return round(roi, 2)
 
 # ===== CLEAN 24H =====
 def clean_old_messages():
     now = datetime.now()
-    new_messages = {}
+    new = {}
 
     for k, v in messages.items():
         t = datetime.fromisoformat(v)
         if now - t < timedelta(hours=24):
-            new_messages[k] = v
+            new[k] = v
 
-    return new_messages
+    return new
+
+# ===== HEARTBEAT =====
+def send_heartbeat():
+    now = datetime.now()
+
+    last = heartbeat.get("last")
+    if last:
+        last = datetime.fromisoformat(last)
+        if now - last < timedelta(hours=1):
+            return
+
+    send_telegram("🤖 Bot attivo e funzionante")
+    heartbeat["last"] = now.isoformat()
+    save_json(HEARTBEAT_FILE, heartbeat)
 
 # ===== MAIN =====
 def main():
     global storico, messages
 
-    print("🔍 Controllo prodotti...")
+    print("🔍 Scan prodotti...")
 
     prodotti = get_products()
-    print(f"PRODOTTI: {len(prodotti)}")
+    print(f"Prodotti trovati: {len(prodotti)}")
 
     messages = clean_old_messages()
 
@@ -118,26 +161,32 @@ def main():
 
         old = storico.get(key)
 
+        prezzo = parse_price(p["price_raw"])
+        roi = calcola_roi(p["name"], p["price_raw"])
+
         cambiato = (
             old is None or
-            old["price"] != p["price"] or
+            old["price_raw"] != p["price_raw"] or
             old["available"] != p["available"]
         )
 
         if not cambiato:
             continue
 
-        # evita spam
+        # anti spam
         if key in messages:
             continue
 
+        # filtro intelligente (evita roba inutile)
+        if roi < 5:
+            continue
+
         stato = "✅ Disponibile" if p["available"] else "❌ Esaurito"
-        roi = calcola_roi(p["price"])
 
         text = f"""
 <b>{p['name']}</b>
 
-💰 {p['price']}
+💰 {p['price_raw']}
 {stato}
 📈 ROI: {roi}%
 """
@@ -147,14 +196,16 @@ def main():
         messages[key] = datetime.now().isoformat()
         nuovi += 1
 
-    print(f"NUOVI ALERT: {nuovi}")
+    print(f"Nuovi alert: {nuovi}")
 
-    # salva tutto
+    # heartbeat
+    send_heartbeat()
+
+    # salva
     save_json(STORICO_FILE, {p["name"]: p for p in prodotti})
     save_json(MESSAGES_FILE, messages)
 
-    print("✅ Fine run")
-
+    print("✅ Fine")
 
 # ===== START =====
 if __name__ == "__main__":
