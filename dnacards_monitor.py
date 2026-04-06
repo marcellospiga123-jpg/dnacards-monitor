@@ -45,13 +45,15 @@ def send_telegram(msg, log):
             timeout=10
         ).json()
 
+        print("TELEGRAM:", r)
+
         if "result" in r:
             log.append({
                 "id": r["result"]["message_id"],
                 "time": time.time()
             })
-    except:
-        print("Errore Telegram")
+    except Exception as e:
+        print("Errore Telegram:", e)
 
 def delete_old_messages(log):
     now = time.time()
@@ -93,7 +95,7 @@ def heartbeat(log, prodotti):
     now = time.time()
 
     if now - hb["last"] > 900:
-        send_telegram(f"🤖 BOT ATTIVO\nProdotti: {len(prodotti)}", log)
+        send_telegram(f"🤖 BOT ATTIVO\nProdotti trovati: {len(prodotti)}", log)
         hb["last"] = now
         save_heartbeat(hb)
 
@@ -119,40 +121,47 @@ def load_github():
     try:
         url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
         headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+
         r = requests.get(url, headers=headers, timeout=10)
+
+        print("LOAD GITHUB STATUS:", r.status_code)
 
         if r.status_code == 200:
             content = base64.b64decode(r.json()["content"]).decode()
             return json.loads(content), r.json()["sha"]
-    except:
-        pass
+
+    except Exception as e:
+        print("Errore load GitHub:", e)
 
     return {}, None
 
 def save_github(data, sha):
-    try:
-        url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
 
-        content = base64.b64encode(
-            json.dumps(data, indent=2).encode()
-        ).decode()
+    content = base64.b64encode(
+        json.dumps(data, indent=2).encode()
+    ).decode()
 
-        payload = {
-            "message": "update prezzi FIX",
-            "content": content,
-            "branch": "main"
-        }
+    payload = {
+        "message": "update prezzi automatico",
+        "content": content,
+        "branch": "main"
+    }
 
-        if sha:
-            payload["sha"] = sha
+    if sha:
+        payload["sha"] = sha
 
-        requests.put(url, headers=headers, json=payload, timeout=10)
-    except:
-        print("Errore salvataggio GitHub")
+    r = requests.put(url, headers=headers, json=payload)
+
+    print("GITHUB STATUS:", r.status_code)
+    print("GITHUB RESPONSE:", r.text)
 
 # ======================
-# SCRAPING FIX (ANTI BLOCCO)
+# SCRAPING
 # ======================
 
 def fetch_with_retry(url):
@@ -179,7 +188,6 @@ def scrape():
             continue
 
         soup = BeautifulSoup(html, "html.parser")
-
         items = soup.select("li.product")
 
         print("Trovati:", len(items))
@@ -232,7 +240,7 @@ def main():
     print("DEBUG PRODOTTI:", prodotti)
 
     if not prodotti:
-        print("⚠️ NESSUN PRODOTTO → blocco sito")
+        print("⚠️ NESSUN PRODOTTO")
         return
 
     heartbeat(log, prodotti)
