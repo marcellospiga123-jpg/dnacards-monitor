@@ -1,198 +1,171 @@
 import requests
 from bs4 import BeautifulSoup
 import json
-import os
+import datetime
 import base64
-from datetime import datetime
-import matplotlib.pyplot as plt
-import statistics
+import os
 
-# ================= CONFIG =================
-URLS = {
-    "JP": "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
-    "EN": "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
-    "SINGLE": "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
-}
+# ======================
+# CONFIG (DA GITHUB SECRETS)
+# ======================
+
+GITHUB_TOKEN = os.getenv("GH_TOKEN")
+REPO = os.getenv("REPO")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-REPO = "marcellospiga123-jpg/dna-dashboard"
-FILE = "storico.json"
+FILE_NAME = "storico.json"
 
-# ================= TELEGRAM =================
-def send(msg):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-        )
-    except:
-        print("Errore Telegram")
+URLS = [
+    "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
+    "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
+    "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
+]
 
-# ================= GITHUB =================
-def load():
-    url = f"https://api.github.com/repos/{REPO}/contents/{FILE}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+# ======================
+# TELEGRAM
+# ======================
+
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram non configurato")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg
+    }
+    requests.post(url, data=data)
+
+# ======================
+# GITHUB LOAD
+# ======================
+
+def load_github():
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}"
+    }
 
     r = requests.get(url, headers=headers)
 
     if r.status_code == 200:
-        data = r.json()
-        content = base64.b64decode(data["content"]).decode()
-        return json.loads(content), data["sha"]
+        content = base64.b64decode(r.json()["content"]).decode()
+        return json.loads(content), r.json()["sha"]
 
     return {}, None
 
-def save(data, sha):
-    url = f"https://api.github.com/repos/{REPO}/contents/{FILE}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+# ======================
+# GITHUB SAVE
+# ======================
 
-    content = base64.b64encode(json.dumps(data, indent=2).encode()).decode()
+def save_github(data, sha):
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
 
-    body = {
-        "message": "update prezzi",
-        "content": content
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}"
+    }
+
+    content = base64.b64encode(
+        json.dumps(data, indent=2).encode()
+    ).decode()
+
+    payload = {
+        "message": "update storico prezzi",
+        "content": content,
+        "branch": "main"
     }
 
     if sha:
-        body["sha"] = sha
+        payload["sha"] = sha
 
-    requests.put(url, headers=headers, json=body)
+    r = requests.put(url, headers=headers, json=payload)
 
-# ================= UTILS =================
-def price(p):
-    try:
-        return float(p.replace("€","").replace(",","."))
-    except:
-        return None
+    print("SAVE STATUS:", r.status_code)
+    print(r.text)
 
-# ================= SCRAPER =================
+# ======================
+# SCRAPING DNA
+# ======================
+
 def scrape():
-    prodotti = {}
+    prodotti = []
 
-    headers = {"User-Agent": "Mozilla/5.0"}
+    for url in URLS:
+        print("Scraping:", url)
 
-    for sito, url in URLS.items():
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
+        html = requests.get(url).text
+        soup = BeautifulSoup(html, "html.parser")
 
-            for p in soup.select("li.product"):
-                nome = p.select_one(".woocommerce-loop-product__title")
-                prezzo = p.select_one(".price .amount")
+        items = soup.select(".product")
 
-                if not nome:
-                    continue
+        for item in items:
+            try:
+                nome = item.select_one("h2").text.strip()
+                prezzo = item.select_one(".price").text.strip()
 
-                nome = nome.text.strip()
+                prezzo = prezzo.replace("€", "").replace(",", ".")
+                prezzo = float(prezzo)
 
-                if prezzo:
-                    prezzo_txt = prezzo.text.strip()
-                else:
-                    prezzo_txt = "OUT"
-
-                prodotti.setdefault(nome, []).append({
-                    "sito": sito,
-                    "prezzo": prezzo_txt
+                prodotti.append({
+                    "nome": nome,
+                    "prezzo": prezzo
                 })
 
-        except:
-            continue
+            except:
+                continue
 
     return prodotti
 
-# ================= ANALISI =================
-def analisi(prodotti, storico):
-    segnali = []
+# ======================
+# MAIN
+# ======================
 
-    for nome, varianti in prodotti.items():
-        prezzi = [price(v["prezzo"]) for v in varianti if price(v["prezzo"])]
-
-        if not prezzi:
-            continue
-
-        best = min(prezzi)
-        hist = storico.get(nome, [])
-
-        valori = [price(x["p"]) for x in hist if price(x["p"])]
-
-        if len(valori) < 3:
-            continue
-
-        avg = sum(valori)/len(valori)
-        max_p = max(valori)
-
-        profit = max_p - best
-        roi = profit / best if best else 0
-
-        if profit > 10 and roi > 0.2:
-            segnali.append(f"""
-🔥 DEAL
-
-{nome}
-
-💰 Prezzo: {best}€
-📈 Target: {round(max_p,2)}€
-ROI: {round(roi*100,1)}%
-""")
-
-    return segnali
-
-# ================= UPDATE =================
-def update(storico, prodotti):
-    t = datetime.now().strftime("%H:%M")
-
-    for nome, varianti in prodotti.items():
-        prezzi = [v for v in varianti if price(v["prezzo"])]
-
-        if not prezzi:
-            continue
-
-        best = min(prezzi, key=lambda x: price(x["prezzo"]))
-
-        storico.setdefault(nome, []).append({
-            "t": t,
-            "p": best["prezzo"]
-        })
-
-    return storico
-
-# ================= GRAFICO =================
-def grafico(storico):
-    plt.figure()
-
-    for nome, dati in list(storico.items())[:5]:
-        prezzi = [price(d["p"]) for d in dati if price(d["p"])]
-        if len(prezzi) > 1:
-            plt.plot(prezzi, label=nome[:10])
-
-    if not plt.gca().has_data():
-        return
-
-    plt.legend()
-    plt.savefig("grafico.png")
-    plt.close()
-
-# ================= MAIN =================
 def main():
-    send("🤖 BOT ATTIVO")
+    print("START BOT")
 
-    storico, sha = load()
+    storico, sha = load_github()
+
+    oggi = str(datetime.date.today())
 
     prodotti = scrape()
-    storico = update(storico, prodotti)
 
-    segnali = analisi(prodotti, storico)
+    if not prodotti:
+        print("Nessun prodotto trovato")
+        return
 
-    for s in segnali:
-        send(s)
+    messaggi = []
 
-    if segnali:
-        grafico(storico)
+    for p in prodotti:
+        nome = p["nome"]
+        prezzo = p["prezzo"]
 
-    save(storico, sha)
+        if nome not in storico:
+            storico[nome] = []
+
+        storico[nome].append({
+            "prezzo": prezzo,
+            "data": oggi
+        })
+
+        # ALERT: se prezzo basso
+        if prezzo < 80:
+            messaggi.append(f"🔥 OFFERTA:\n{nome}\n💰 {prezzo}€")
+
+    save_github(storico, sha)
+
+    # TELEGRAM
+    for m in messaggi:
+        send_telegram(m)
+
+    print("FINE")
+
+# ======================
+# RUN
+# ======================
 
 if __name__ == "__main__":
     main()
