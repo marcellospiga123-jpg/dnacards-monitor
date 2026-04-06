@@ -4,9 +4,10 @@ import json
 import datetime
 import base64
 import os
+import time
 
 # ======================
-# CONFIG (DA GITHUB SECRETS)
+# CONFIG
 # ======================
 
 GITHUB_TOKEN = os.getenv("GH_TOKEN")
@@ -37,7 +38,11 @@ def send_telegram(msg):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": msg
     }
-    requests.post(url, data=data)
+
+    try:
+        requests.post(url, data=data, timeout=10)
+    except:
+        print("Errore invio Telegram")
 
 # ======================
 # GITHUB LOAD
@@ -50,7 +55,10 @@ def load_github():
         "Authorization": f"token {GITHUB_TOKEN}"
     }
 
-    r = requests.get(url, headers=headers)
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+    except:
+        return {}, None
 
     if r.status_code == 200:
         content = base64.b64decode(r.json()["content"]).decode()
@@ -82,25 +90,38 @@ def save_github(data, sha):
     if sha:
         payload["sha"] = sha
 
-    r = requests.put(url, headers=headers, json=payload)
-
-    print("SAVE STATUS:", r.status_code)
-    print(r.text)
+    try:
+        r = requests.put(url, headers=headers, json=payload, timeout=10)
+        print("SAVE STATUS:", r.status_code)
+    except:
+        print("Errore salvataggio GitHub")
 
 # ======================
-# SCRAPING DNA
+# SCRAPING (FIXATO)
 # ======================
 
 def scrape():
     prodotti = []
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+
     for url in URLS:
         print("Scraping:", url)
 
-        html = requests.get(url).text
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            html = r.text
+        except Exception as e:
+            print("Errore connessione:", e)
+            continue
+
         soup = BeautifulSoup(html, "html.parser")
 
         items = soup.select(".product")
+
+        print("Prodotti trovati:", len(items))
 
         for item in items:
             try:
@@ -117,6 +138,8 @@ def scrape():
 
             except:
                 continue
+
+        time.sleep(2)  # anti blocco
 
     return prodotti
 
@@ -151,13 +174,12 @@ def main():
             "data": oggi
         })
 
-        # ALERT: se prezzo basso
+        # ALERT
         if prezzo < 80:
             messaggi.append(f"🔥 OFFERTA:\n{nome}\n💰 {prezzo}€")
 
     save_github(storico, sha)
 
-    # TELEGRAM
     for m in messaggi:
         send_telegram(m)
 
