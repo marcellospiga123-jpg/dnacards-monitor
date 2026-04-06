@@ -3,6 +3,8 @@ from bs4 import BeautifulSoup
 import json
 import os
 from datetime import datetime, timedelta
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # ===== CONFIG =====
