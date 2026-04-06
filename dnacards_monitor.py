@@ -26,6 +26,13 @@ URLS = [
     "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
 ]
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "it-IT,it;q=0.9",
+    "Accept": "text/html,application/xhtml+xml",
+    "Connection": "keep-alive"
+}
+
 # ======================
 # TELEGRAM
 # ======================
@@ -41,10 +48,11 @@ def send_telegram(msg, log):
             timeout=10
         ).json()
 
-        log.append({
-            "id": r["result"]["message_id"],
-            "time": time.time()
-        })
+        if "result" in r:
+            log.append({
+                "id": r["result"]["message_id"],
+                "time": time.time()
+            })
 
     except:
         print("Errore Telegram")
@@ -119,6 +127,9 @@ def save_local(file, data):
 # ======================
 
 def load_github():
+    if not GITHUB_TOKEN or not REPO:
+        return {}, None
+
     url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
@@ -133,6 +144,9 @@ def load_github():
     return {}, None
 
 def save_github(data, sha):
+    if not GITHUB_TOKEN or not REPO:
+        return
+
     url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
@@ -141,7 +155,7 @@ def save_github(data, sha):
     ).decode()
 
     payload = {
-        "message": "update prezzi PRO",
+        "message": "update prezzi AUTO",
         "content": content,
         "branch": "main"
     }
@@ -152,26 +166,36 @@ def save_github(data, sha):
     try:
         requests.put(url, headers=headers, json=payload, timeout=10)
     except:
-        print("Errore salvataggio")
+        print("Errore salvataggio GitHub")
 
 # ======================
-# SCRAPING
+# SCRAPING (FIXED)
 # ======================
 
 def scrape():
     prodotti = []
 
-    headers = {"User-Agent": "Mozilla/5.0"}
-
     for url in URLS:
+        print("Scraping:", url)
+
         try:
-            r = requests.get(url, headers=headers, timeout=15)
+            r = requests.get(url, headers=HEADERS, timeout=20)
             soup = BeautifulSoup(r.text, "html.parser")
 
-            for item in soup.select(".product"):
+            items = soup.select("li.product")
+
+            print("Trovati:", len(items))
+
+            for item in items:
                 try:
                     nome = item.select_one("h2").text.strip()
-                    prezzo = float(item.select_one(".price").text.strip().replace("€","").replace(",","."))
+
+                    prezzo_raw = item.select_one(".price").text
+                    prezzo = float(
+                        prezzo_raw.replace("€", "")
+                        .replace(",", ".")
+                        .strip()
+                    )
 
                     disponibile = True
                     if "esaurito" in item.text.lower():
@@ -182,14 +206,16 @@ def scrape():
                         "prezzo": prezzo,
                         "disponibile": disponibile
                     })
+
                 except:
                     continue
 
-        except:
-            continue
+        except Exception as e:
+            print("Errore scraping:", e)
 
         time.sleep(2)
 
+    print("PRODOTTI TOTALI:", len(prodotti))
     return prodotti
 
 # ======================
@@ -221,10 +247,9 @@ def main():
     prodotti = scrape()
 
     if not prodotti:
-        print("No prodotti")
+        print("⚠️ Nessun prodotto trovato")
         return
 
-    # HEARTBEAT 15 MIN
     heartbeat(log, prodotti)
 
     for p in prodotti:
@@ -254,7 +279,6 @@ def main():
         if not disponibile:
             send_telegram(f"❌ ESAURITO:\n{nome}", log)
 
-    # PULIZIA 24H
     log = delete_old_messages(log)
     save_local(MSG_FILE, log)
 
