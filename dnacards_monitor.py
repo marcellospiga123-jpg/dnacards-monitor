@@ -1,14 +1,16 @@
-
 import requests
 from bs4 import BeautifulSoup
 import os
 import json
+import base64
 from datetime import datetime, timedelta
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+REPO = os.getenv("REPO")
+GH_TOKEN = os.getenv("GH_TOKEN")
 
 STORICO_FILE = "storico.json"
+UTENTI_FILE = "utenti.json"
 
 URLS = [
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
@@ -17,34 +19,78 @@ URLS = [
 ]
 
 # ---------- TELEGRAM ----------
-def send(msg):
+def send(chat_id, msg):
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": msg}
+        data={"chat_id": chat_id, "text": msg}
     )
 
-# ---------- LOAD/SAVE ----------
-def load_storico():
-    if not os.path.exists(STORICO_FILE):
-        return {}
-    with open(STORICO_FILE, "r") as f:
-        return json.load(f)
+def broadcast(msg, utenti):
+    for u in utenti:
+        send(u, msg)
 
-def save_storico(data):
-    with open(STORICO_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+# ---------- GITHUB ----------
+def get_file(name):
+    url = f"https://api.github.com/repos/{REPO}/contents/{name}"
+    headers = {"Authorization": f"token {GH_TOKEN}"}
+    r = requests.get(url, headers=headers)
 
-# ---------- CLEAN OLD ----------
-def clean_old(storico):
-    now = datetime.now()
-    new_data = {}
+    if r.status_code == 200:
+        content = base64.b64decode(r.json()["content"]).decode()
+        return json.loads(content), r.json()["sha"]
+    return {}, None
 
-    for k, v in storico.items():
-        t = datetime.fromisoformat(v["time"])
-        if now - t < timedelta(hours=24):
-            new_data[k] = v
+def save_file(name, data, sha):
+    url = f"https://api.github.com/repos/{REPO}/contents/{name}"
+    headers = {"Authorization": f"token {GH_TOKEN}"}
 
-    return new_data
+    content = base64.b64encode(json.dumps(data, indent=2).encode()).decode()
+
+    payload = {
+        "message": "auto update",
+        "content": content,
+        "branch": "main"
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    requests.put(url, headers=headers, json=payload)
+
+# ---------- UTENTI ----------
+def get_utenti():
+    utenti, sha = get_file(UTENTI_FILE)
+    return utenti if isinstance(utenti, list) else [], sha
+
+def save_utenti(data, sha):
+    save_file(UTENTI_FILE, data, sha)
+
+def handle_commands():
+    utenti, sha = get_utenti()
+
+    updates = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    ).json()
+
+    for u in updates.get("result", []):
+        msg = u.get("message", {})
+        chat_id = msg.get("chat", {}).get("id")
+        text = msg.get("text", "")
+
+        if not chat_id:
+            continue
+
+        if text == "/start" and chat_id not in utenti:
+            utenti.append(chat_id)
+            save_utenti(utenti, sha)
+            send(chat_id, "✅ Registrato")
+
+        elif text == "/stop" and chat_id in utenti:
+            utenti.remove(chat_id)
+            save_utenti(utenti, sha)
+            send(chat_id, "❌ Disiscritto")
+
+    return utenti
 
 # ---------- SCRAPER ----------
 def scrape():
@@ -54,19 +100,15 @@ def scrape():
         res = requests.get(url)
         soup = BeautifulSoup(res.text, "html.parser")
 
-        cards = soup.select(".product")
-
-        for c in cards:
+        for c in soup.select(".product"):
             nome = c.select_one("h2").text.strip()
 
             prezzo = 0
             p = c.select_one(".price")
             if p:
-                prezzo = float(
-                    p.text.replace("€", "").replace(",", ".").strip()
-                )
+                prezzo = float(p.text.replace("€", "").replace(",", "."))
 
-            disponibile = "Esaurito" not in c.text
+            disponibile = "esaurito" not in c.text.lower()
 
             prodotti.append({
                 "nome": nome,
@@ -77,66 +119,62 @@ def scrape():
     return prodotti
 
 # ---------- ROI ----------
-def calcola_roi(prezzo):
-    target = 120  # puoi cambiare
-    return round(((target - prezzo) / prezzo) * 100, 2) if prezzo > 0 else 0
+def roi(prezzo):
+    return round(((120 - prezzo) / prezzo) * 100, 2) if prezzo else 0
 
 # ---------- MAIN ----------
 def main():
-    print("🚀 BOT AVVIATO")
+    utenti = handle_commands()
+    if not utenti:
+        return
 
-    storico = load_storico()
-    storico = clean_old(storico)
+    storico, sha = get_file(STORICO_FILE)
+    if not isinstance(storico, dict):
+        storico = {}
+
+    now = datetime.now()
 
     prodotti = scrape()
-    print(f"PRODOTTI: {len(prodotti)}")
 
-    nuovi_alert = []
+    alert = []
 
     for p in prodotti:
-        key = p["nome"]
+        nome = p["nome"]
         prezzo = p["prezzo"]
         disp = p["disp"]
 
-        old = storico.get(key)
+        old = storico.get(nome)
 
-        changed = False
+        if not old or old["prezzo"] != prezzo or old["disp"] != disp:
+            msg = f"📦 {nome}\n💰 {prezzo}€\n"
+            msg += "✅ Disponibile\n" if disp else "❌ Esaurito\n"
+            msg += f"📈 ROI: {roi(prezzo)}%"
 
-        if not old:
-            changed = True
-        else:
-            if old["prezzo"] != prezzo or old["disp"] != disp:
-                changed = True
+            alert.append(msg)
 
-        if changed:
-            roi = calcola_roi(prezzo)
-
-            msg = f"📦 {key}\n💰 {prezzo}€\n"
-
-            if disp:
-                msg += "✅ Disponibile\n"
-            else:
-                msg += "❌ Esaurito\n"
-
-            msg += f"📈 ROI: {roi}%"
-
-            nuovi_alert.append(msg)
-
-        storico[key] = {
+        storico[nome] = {
             "prezzo": prezzo,
             "disp": disp,
-            "time": datetime.now().isoformat()
+            "time": now.isoformat()
         }
 
-    save_storico(storico)
+    # clean 24h
+    storico = {
+        k: v for k, v in storico.items()
+        if now - datetime.fromisoformat(v["time"]) < timedelta(hours=24)
+    }
 
-    # ---------- SEND ----------
-    if nuovi_alert:
-        send("🔥 NUOVI AGGIORNAMENTI 🔥")
-        for m in nuovi_alert[:10]:
-            send(m)
+    save_file(STORICO_FILE, storico, sha)
 
-    send(f"💓 BOT ATTIVO\nProdotti: {len(prodotti)}")
+    # send alerts
+    if alert:
+        broadcast("🔥 AGGIORNAMENTI 🔥", utenti)
+        for a in alert[:10]:
+            broadcast(a, utenti)
+
+    # heartbeat ogni ora
+    if now.minute < 5:
+        broadcast(f"💓 BOT ATTIVO\nProdotti: {len(prodotti)}", utenti)
 
 if __name__ == "__main__":
     main()
