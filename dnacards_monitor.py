@@ -18,6 +18,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 FILE_NAME = "storico.json"
 MSG_FILE = "messages.json"
+HEARTBEAT_FILE = "heartbeat.json"
 
 URLS = [
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
@@ -53,7 +54,7 @@ def delete_old_messages(log):
     nuovi = []
 
     for m in log:
-        if now - m["time"] > 86400:  # 24h
+        if now - m["time"] > 86400:
             try:
                 requests.post(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage",
@@ -68,6 +69,36 @@ def delete_old_messages(log):
             nuovi.append(m)
 
     return nuovi
+
+# ======================
+# HEARTBEAT 15 MIN
+# ======================
+
+def load_heartbeat():
+    if os.path.exists(HEARTBEAT_FILE):
+        with open(HEARTBEAT_FILE) as f:
+            return json.load(f)
+    return {"last": 0}
+
+def save_heartbeat(data):
+    with open(HEARTBEAT_FILE, "w") as f:
+        json.dump(data, f)
+
+def heartbeat(log, prodotti):
+    hb = load_heartbeat()
+    now = time.time()
+
+    if now - hb["last"] > 900:
+        msg = f"""🤖 BOT ATTIVO
+
+📦 Prodotti: {len(prodotti)}
+⏱️ Check ogni 15 min
+✅ Sistema operativo
+"""
+        send_telegram(msg, log)
+
+        hb["last"] = now
+        save_heartbeat(hb)
 
 # ======================
 # FILE LOCALI
@@ -189,8 +220,12 @@ def main():
     oggi = str(datetime.date.today())
     prodotti = scrape()
 
-    # HEARTBEAT
-    send_telegram(f"🤖 BOT ATTIVO\n📦 Prodotti: {len(prodotti)}", log)
+    if not prodotti:
+        print("No prodotti")
+        return
+
+    # HEARTBEAT 15 MIN
+    heartbeat(log, prodotti)
 
     for p in prodotti:
         nome = p["nome"]
