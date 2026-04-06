@@ -27,10 +27,8 @@ URLS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept-Language": "it-IT,it;q=0.9",
-    "Accept": "text/html,application/xhtml+xml",
-    "Connection": "keep-alive"
+    "User-Agent": "Mozilla/5.0",
+    "Accept-Language": "it-IT,it;q=0.9"
 }
 
 # ======================
@@ -114,7 +112,7 @@ def save_local(file, data):
         json.dump(data, f, indent=2)
 
 # ======================
-# GITHUB
+# GITHUB (FIX 404)
 # ======================
 
 def load_github():
@@ -130,10 +128,15 @@ def load_github():
             content = base64.b64decode(r.json()["content"]).decode()
             return json.loads(content), r.json()["sha"]
 
+        elif r.status_code == 404:
+            print("⚠️ File non esiste → verrà creato")
+            return {}, None
+
     except Exception as e:
         print("Errore load GitHub:", e)
 
     return {}, None
+
 
 def save_github(data, sha):
     url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
@@ -161,19 +164,16 @@ def save_github(data, sha):
     print("GITHUB RESPONSE:", r.text)
 
 # ======================
-# SCRAPING
+# SCRAPING (STABILE)
 # ======================
 
-def fetch_with_retry(url):
-    for i in range(3):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-            if r.status_code == 200:
-                return r.text
-        except Exception as e:
-            print("Retry errore:", e)
-            time.sleep(5)
-    return None
+def fetch(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        return r.text
+    except Exception as e:
+        print("Errore fetch:", e)
+        return None
 
 def scrape():
     prodotti = []
@@ -181,20 +181,14 @@ def scrape():
     for url in URLS:
         print("Scraping:", url)
 
-        html = fetch_with_retry(url)
-
+        html = fetch(url)
         if not html:
-            print("❌ HTML non ricevuto")
             continue
 
         soup = BeautifulSoup(html, "html.parser")
         items = soup.select("li.product")
 
         print("Trovati:", len(items))
-
-        if len(items) == 0:
-            print("⚠️ BLOCCO o HTML cambiato")
-            continue
 
         for item in items:
             try:
@@ -220,7 +214,7 @@ def scrape():
             except Exception as e:
                 print("Errore parsing:", e)
 
-        time.sleep(3)
+        time.sleep(2)
 
     print("PRODOTTI TOTALI:", len(prodotti))
     return prodotti
@@ -234,28 +228,25 @@ def main():
     log = load_local(MSG_FILE)
 
     oggi = str(datetime.date.today())
-
     prodotti = scrape()
 
     print("DEBUG PRODOTTI:", prodotti)
 
     if not prodotti:
-        print("⚠️ NESSUN PRODOTTO")
+        print("⚠️ NESSUN PRODOTTO → STOP")
         return
 
     heartbeat(log, prodotti)
 
     for p in prodotti:
         nome = p["nome"]
-        prezzo = p["prezzo"]
-        disponibile = p["disponibile"]
 
         storico.setdefault(nome, [])
 
         storico[nome].append({
-            "prezzo": prezzo,
+            "prezzo": p["prezzo"],
             "data": oggi,
-            "disponibile": disponibile
+            "disponibile": p["disponibile"]
         })
 
     log = delete_old_messages(log)
