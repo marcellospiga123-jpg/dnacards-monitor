@@ -1,18 +1,10 @@
 import requests
 from bs4 import BeautifulSoup
-import json
+import time
 import os
-import base64
-from datetime import datetime, timedelta
 
-# ===== CONFIG =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-GITHUB_TOKEN = os.getenv("GH_TOKEN")
-REPO = os.getenv("REPO")  # es: marcellospiga123-jpg/dnacards-monitor
-
-FILE_NAME = "storico.json"
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 URLS = [
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
@@ -20,167 +12,149 @@ URLS = [
     "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
 ]
 
-# ===== TELEGRAM =====
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram non configurato")
-        return
+storico = {}
+messaggi = []
+last_heartbeat = 0
+last_cleanup = time.time()
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg
-    })
+# ---------------- TELEGRAM ---------------- #
 
-# ===== SCRAPER =====
+def send(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        r = requests.post(url, data={
+            "chat_id": CHAT_ID,
+            "text": msg
+        }, timeout=10)
+
+        if r.status_code == 200:
+            msg_id = r.json()["result"]["message_id"]
+            messaggi.append(msg_id)
+
+    except Exception as e:
+        print("Errore invio telegram:", e)
+
+def delete_all():
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
+
+    for m in messaggi:
+        try:
+            requests.post(url, data={
+                "chat_id": CHAT_ID,
+                "message_id": m
+            }, timeout=5)
+        except:
+            pass
+
+    messaggi.clear()
+
+# ---------------- SCRAPER ---------------- #
+
 def scrape():
     prodotti = []
 
     for url in URLS:
-        print("Scraping:", url)
-        r = requests.get(url, timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
+        try:
+            res = requests.get(url, timeout=10)
+            soup = BeautifulSoup(res.text, "html.parser")
 
-        cards = soup.select(".product")
+            cards = soup.select(".product")
 
-        for c in cards:
-            nome = c.select_one(".woocommerce-loop-product__title")
-            prezzo = c.select_one(".price")
-            text = c.text.lower()
+            for c in cards:
+                nome = c.select_one("h2").text.strip()
 
-            if not nome or not prezzo:
-                continue
+                prezzo_tag = c.select_one(".price")
+                prezzo = 0
 
-            disponibile = "esaurito" not in text
+                if prezzo_tag:
+                    prezzo = float(
+                        prezzo_tag.text
+                        .replace("€", "")
+                        .replace(",", ".")
+                        .strip()
+                    )
 
-            try:
-                prezzo_val = float(prezzo.text.replace("€", "").replace(",", ".").strip())
-            except:
-                continue
+                disponibile = "Esaurito" not in c.text
 
-            prodotti.append({
-                "nome": nome.text.strip(),
-                "prezzo": prezzo_val,
-                "disponibile": disponibile
-            })
+                prodotti.append({
+                    "nome": nome,
+                    "prezzo": prezzo,
+                    "disponibile": disponibile
+                })
 
-    print("PRODOTTI:", len(prodotti))
+        except Exception as e:
+            print("Errore scraping:", e)
+
+    print(f"PRODOTTI TROVATI: {len(prodotti)}")
     return prodotti
 
-# ===== GITHUB =====
-def get_github_file():
-    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+# ---------------- LOGICA ---------------- #
 
-    r = requests.get(url, headers=headers)
+def check(prodotti):
+    global storico
 
-    print("GITHUB STATUS:", r.status_code)
+    for p in prodotti:
+        nome = p["nome"]
 
-    if r.status_code == 200:
-        content = base64.b64decode(r.json()["content"]).decode()
-        return json.loads(content), r.json()["sha"]
-    else:
-        return [], None
+        if nome not in storico:
+            storico[nome] = p
 
-def save_to_github(storico, sha):
-    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+            send(f"🆕 NUOVO\n{nome}\n💰 {p['prezzo']}€")
 
-    content = base64.b64encode(json.dumps(storico, indent=2).encode()).decode()
+        else:
+            old = storico[nome]
 
-    payload = {
-        "message": "update dati",
-        "content": content
-    }
+            # prezzo
+            if p["prezzo"] != old["prezzo"]:
+                diff = round(p["prezzo"] - old["prezzo"], 2)
 
-    if sha:
-        payload["sha"] = sha
+                send(
+                    f"💸 PREZZO CAMBIATO\n{nome}\n"
+                    f"{old['prezzo']}€ ➜ {p['prezzo']}€\n"
+                    f"ROI: {diff}€"
+                )
 
-    r = requests.put(url, headers=headers, json=payload)
+            # disponibilità
+            if p["disponibile"] != old["disponibile"]:
+                stato = "🟢 DISPONIBILE" if p["disponibile"] else "🔴 ESAURITO"
+                send(f"{stato}\n{nome}")
 
-    print("UPLOAD STATUS:", r.status_code)
-    print(r.text)
+            storico[nome] = p
 
-# ===== ROI =====
-def calcola_roi(prodotti):
-    prezzi = [p["prezzo"] for p in prodotti if p["disponibile"]]
-    if len(prezzi) < 2:
-        return 0
-    return round((max(prezzi) - min(prezzi)) / min(prezzi) * 100, 2)
+# ---------------- HEARTBEAT ---------------- #
 
-# ===== PULIZIA 24H =====
-def pulisci_storico(storico):
-    nuovo = []
-    limite = datetime.now() - timedelta(hours=24)
-
-    for entry in storico:
-        ts = datetime.fromisoformat(entry["timestamp"])
-        if ts > limite:
-            nuovo.append(entry)
-
-    return nuovo
-
-# ===== CONFRONTO =====
-def confronta(vecchi, nuovi):
-    notifiche = []
-
-    if not vecchi:
-        return []
-
-    ultimi = vecchi[-1]["prodotti"]
-
-    for p in nuovi:
-        for old in ultimi:
-            if p["nome"] == old["nome"]:
-                # prezzo cambiato
-                if p["prezzo"] != old["prezzo"]:
-                    notifiche.append(f"💰 Prezzo cambiato:\n{p['nome']}\n{old['prezzo']}€ → {p['prezzo']}€")
-
-                # torna disponibile
-                if p["disponibile"] and not old["disponibile"]:
-                    notifiche.append(f"🔥 Disponibile di nuovo:\n{p['nome']}")
-
-    return notifiche
-
-# ===== HEARTBEAT =====
 def heartbeat():
-    send_telegram("💓 Bot attivo (heartbeat 15 min)")
+    global last_heartbeat
 
-# ===== MAIN =====
+    now = time.time()
+
+    if now - last_heartbeat > 900:
+        send("💓 BOT ATTIVO")
+        last_heartbeat = now
+
+# ---------------- MAIN ---------------- #
+
 def main():
-    prodotti = scrape()
+    global last_cleanup
 
-    if not prodotti:
-        send_telegram("❌ Nessun prodotto trovato")
-        return
+    send("🚀 BOT AVVIATO")
 
-    storico, sha = get_github_file()
+    while True:
+        try:
+            prodotti = scrape()
+            check(prodotti)
+            heartbeat()
 
-    storico = pulisci_storico(storico)
+            # cleanup ogni 24h
+            if time.time() - last_cleanup > 86400:
+                delete_all()
+                last_cleanup = time.time()
+                send("🧹 Pulizia completata")
 
-    notifiche = confronta(storico, prodotti)
+        except Exception as e:
+            send(f"❌ ERRORE: {e}")
 
-    # aggiungi nuovi dati
-    storico.append({
-        "timestamp": datetime.now().isoformat(),
-        "prodotti": prodotti
-    })
+        time.sleep(60)
 
-    save_to_github(storico, sha)
-
-    disponibili = [p for p in prodotti if p["disponibile"]]
-
-    msg = f"""🤖 BOT ATTIVO
-Prodotti: {len(prodotti)}
-Disponibili: {len(disponibili)}
-ROI: {calcola_roi(prodotti)}%
-"""
-
-    send_telegram(msg)
-
-    for n in notifiche:
-        send_telegram(n)
-
-# ===== RUN =====
 if __name__ == "__main__":
     main()
