@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DNA Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+<h1>🚀 DNA Dashboard</h1>
+<button onclick="carica()">Carica dati</button>
+
+<canvas id="grafico"></canvas>
+
+<script>
+async function carica() {
+    try {
+        const res = await fetch("https://raw.githubusercontent.com/marcellospiga123-jpg/dnacards-monitor/main/dati.json");
+        
+        if (!res.ok) {
+            alert("ERRORE fetch dati.json");
+            return;
+        }
+
+        const dati = await res.json();
+
+        if (!dati.length) {
+            alert("Nessun dato!");
+            return;
+        }
+
+        const labels = dati.map(d => new Date(d.timestamp).toLocaleTimeString());
+        const prezzi = dati.map(d => d.prezzo_medio);
+
+        new Chart(document.getElementById("grafico"), {
+            type: "line",
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: "Prezzo medio",
+                    data: prezzi
+                }]
+            }
+        });
+
+    } catch (e) {
+        alert("Errore JS: " + e);
+    }
+}
+</script>
+
+</body>
+</html>
