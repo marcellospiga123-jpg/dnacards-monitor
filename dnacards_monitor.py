@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import json
 import os
 from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
 
 # ===== CONFIG =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -16,9 +17,10 @@ URLS = [
 
 STORICO_FILE = "storico.json"
 MESSAGES_FILE = "messages.json"
+HISTORY_FILE = "price_history.json"
 HEARTBEAT_FILE = "heartbeat.json"
 
-# ===== UTIL =====
+# ===== LOAD =====
 def load_json(file):
     if not os.path.exists(file):
         return {}
@@ -31,6 +33,7 @@ def save_json(file, data):
 
 storico = load_json(STORICO_FILE)
 messages = load_json(MESSAGES_FILE)
+history = load_json(HISTORY_FILE)
 heartbeat = load_json(HEARTBEAT_FILE)
 
 # ===== TELEGRAM =====
@@ -53,6 +56,11 @@ def send_telegram(text, link=None):
     for chat_id in CHAT_IDS:
         payload["chat_id"] = chat_id
         requests.post(url, json=payload)
+
+def send_photo(chat_id, file_path, caption=""):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    with open(file_path, "rb") as f:
+        requests.post(url, data={"chat_id": chat_id, "caption": caption}, files={"photo": f})
 
 # ===== SCRAPER =====
 def get_products():
@@ -82,64 +90,87 @@ def get_products():
 
                 except:
                     continue
-
         except:
             continue
 
     return prodotti
 
-# ===== PARSE PREZZO =====
+# ===== PREZZO =====
 def parse_price(price):
     try:
         return float(price.replace("€", "").replace(",", ".").split()[0])
     except:
         return 0
 
-# ===== ROI REALE =====
+# ===== ROI =====
 def calcola_roi(nome, prezzo):
     p = parse_price(prezzo)
 
-    # stima valore medio rivendita (logica migliorata)
-    if "OP-05" in nome or "OP05" in nome:
+    if "OP-05" in nome:
         resale = 140
     elif "OP-06" in nome:
         resale = 130
     elif "OP-07" in nome:
         resale = 125
-    elif "PRB" in nome:
-        resale = 110
     else:
         resale = 115
 
     if p == 0:
         return 0
 
-    roi = ((resale - p) / p) * 100
-    return round(roi, 2)
+    return round(((resale - p) / p) * 100, 2)
 
-# ===== CLEAN 24H =====
+# ===== GRAFICO =====
+def generate_graph(name):
+    if name not in history or len(history[name]) < 2:
+        return None
+
+    prices = [x["price"] for x in history[name]]
+    times = list(range(len(prices)))
+
+    plt.figure()
+    plt.plot(times, prices)
+    plt.title(name[:40])
+    plt.xlabel("Time")
+    plt.ylabel("Price €")
+
+    filename = f"graph_{hash(name)}.png"
+    plt.savefig(filename)
+    plt.close()
+
+    return filename
+
+# ===== TREND =====
+def update_history(name, price):
+    if name not in history:
+        history[name] = []
+
+    history[name].append({
+        "price": price,
+        "time": datetime.now().isoformat()
+    })
+
+    history[name] = history[name][-20:]
+
+# ===== CLEAN =====
 def clean_old_messages():
     now = datetime.now()
-    new = {}
-
-    for k, v in messages.items():
-        t = datetime.fromisoformat(v)
-        if now - t < timedelta(hours=24):
-            new[k] = v
-
-    return new
+    return {
+        k: v for k, v in messages.items()
+        if now - datetime.fromisoformat(v) < timedelta(hours=24)
+    }
 
 # ===== HEARTBEAT =====
 def send_heartbeat():
     now = datetime.now()
-
     last = heartbeat.get("last")
+
     if last:
         last = datetime.fromisoformat(last)
         if now - last < timedelta(hours=1):
             return
 
-    send_telegram("🤖 Bot attivo e funzionante")
+    send_telegram("🤖 Bot attivo (scalping + grafici)")
     heartbeat["last"] = now.isoformat()
     save_json(HEARTBEAT_FILE, heartbeat)
 
@@ -147,44 +178,42 @@ def send_heartbeat():
 def main():
     global storico, messages
 
-    print("🔍 Scan prodotti...")
-
     prodotti = get_products()
-    print(f"Prodotti trovati: {len(prodotti)}")
-
     messages = clean_old_messages()
 
-    nuovi = 0
-
     for p in prodotti:
-        key = p["name"]
+        name = p["name"]
+        price_val = parse_price(p["price_raw"])
+        roi = calcola_roi(name, p["price_raw"])
 
-        old = storico.get(key)
+        update_history(name, price_val)
 
-        prezzo = parse_price(p["price_raw"])
-        roi = calcola_roi(p["name"], p["price_raw"])
+        old = storico.get(name)
 
-        cambiato = (
-            old is None or
-            old["price_raw"] != p["price_raw"] or
-            old["available"] != p["available"]
-        )
+        is_new = old is None
+        price_drop = old and price_val < parse_price(old["price_raw"])
+        back_stock = old and not old["available"] and p["available"]
 
-        if not cambiato:
+        if not (is_new or price_drop or back_stock):
             continue
 
-        # anti spam
-        if key in messages:
+        if name in messages:
             continue
 
-        # filtro intelligente (evita roba inutile)
-        if roi < 5:
-            continue
+        alert = ""
+        if back_stock:
+            alert = "🔥 TORNATO DISPONIBILE"
+        elif price_drop:
+            alert = "💸 PREZZO SCESO"
+        elif roi > 25:
+            alert = "💎 SUPER DEAL"
 
         stato = "✅ Disponibile" if p["available"] else "❌ Esaurito"
 
         text = f"""
-<b>{p['name']}</b>
+{alert}
+
+<b>{name}</b>
 
 💰 {p['price_raw']}
 {stato}
@@ -193,20 +222,19 @@ def main():
 
         send_telegram(text, p["link"])
 
-        messages[key] = datetime.now().isoformat()
-        nuovi += 1
+        # GRAFICO
+        graph = generate_graph(name)
+        if graph:
+            for chat_id in CHAT_IDS:
+                send_photo(chat_id, graph, "📉 Andamento prezzo")
 
-    print(f"Nuovi alert: {nuovi}")
+        messages[name] = datetime.now().isoformat()
 
-    # heartbeat
-    send_heartbeat()
-
-    # salva
     save_json(STORICO_FILE, {p["name"]: p for p in prodotti})
     save_json(MESSAGES_FILE, messages)
+    save_json(HISTORY_FILE, history)
 
-    print("✅ Fine")
+    send_heartbeat()
 
-# ===== START =====
 if __name__ == "__main__":
     main()
