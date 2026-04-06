@@ -17,6 +17,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 FILE_NAME = "storico.json"
+MSG_FILE = "messages.json"
 
 URLS = [
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
@@ -28,19 +29,59 @@ URLS = [
 # TELEGRAM
 # ======================
 
-def send_telegram(msg):
+def send_telegram(msg, log):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     try:
-        requests.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg
-        }, timeout=10)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=10
+        ).json()
+
+        log.append({
+            "id": r["result"]["message_id"],
+            "time": time.time()
+        })
+
     except:
         print("Errore Telegram")
+
+def delete_old_messages(log):
+    now = time.time()
+    nuovi = []
+
+    for m in log:
+        if now - m["time"] > 86400:  # 24h
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage",
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "message_id": m["id"]
+                    }
+                )
+            except:
+                continue
+        else:
+            nuovi.append(m)
+
+    return nuovi
+
+# ======================
+# FILE LOCALI
+# ======================
+
+def load_local(file):
+    if os.path.exists(file):
+        with open(file) as f:
+            return json.load(f)
+    return []
+
+def save_local(file, data):
+    with open(file, "w") as f:
+        json.dump(data, f, indent=2)
 
 # ======================
 # GITHUB
@@ -59,7 +100,6 @@ def load_github():
         pass
 
     return {}, None
-
 
 def save_github(data, sha):
     url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
@@ -84,84 +124,59 @@ def save_github(data, sha):
         print("Errore salvataggio")
 
 # ======================
-# SCRAPING PRO
+# SCRAPING
 # ======================
 
 def scrape():
     prodotti = []
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     for url in URLS:
-        print("Scraping:", url)
-
         try:
             r = requests.get(url, headers=headers, timeout=15)
-            html = r.text
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            for item in soup.select(".product"):
+                try:
+                    nome = item.select_one("h2").text.strip()
+                    prezzo = float(item.select_one(".price").text.strip().replace("€","").replace(",","."))
+
+                    disponibile = True
+                    if "esaurito" in item.text.lower():
+                        disponibile = False
+
+                    prodotti.append({
+                        "nome": nome,
+                        "prezzo": prezzo,
+                        "disponibile": disponibile
+                    })
+                except:
+                    continue
+
         except:
             continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        items = soup.select(".product")
-
-        for item in items:
-            try:
-                nome = item.select_one("h2").text.strip()
-                prezzo_raw = item.select_one(".price").text.strip()
-
-                prezzo = float(
-                    prezzo_raw.replace("€", "").replace(",", ".")
-                )
-
-                # ✅ DISPONIBILITÀ
-                disponibile = True
-                testo = item.text.lower()
-
-                if "esaurito" in testo or "out of stock" in testo:
-                    disponibile = False
-
-                prodotti.append({
-                    "nome": nome,
-                    "prezzo": prezzo,
-                    "disponibile": disponibile
-                })
-
-            except:
-                continue
 
         time.sleep(2)
 
     return prodotti
 
 # ======================
-# ANALISI PRO
+# ANALISI
 # ======================
 
-def analizza(storico, prodotto):
-    nome = prodotto["nome"]
-    prezzo = prodotto["prezzo"]
-
-    if nome not in storico or len(storico[nome]) == 0:
+def analizza(storico, nome, prezzo):
+    if nome not in storico or len(storico[nome]) < 2:
         return None
 
-    prezzi_passati = [x["prezzo"] for x in storico[nome]]
-
-    minimo = min(prezzi_passati)
-    ultimo = prezzi_passati[-1]
+    prezzi = [x["prezzo"] for x in storico[nome]]
+    ultimo = prezzi[-1]
+    minimo = min(prezzi)
 
     variazione = prezzo - ultimo
-
-    # ROI simulato
     roi = ((minimo - prezzo) / prezzo) * 100
 
-    return {
-        "min": minimo,
-        "ultimo": ultimo,
-        "variazione": variazione,
-        "roi": round(roi, 2)
-    }
+    return variazione, round(roi, 2), ultimo
 
 # ======================
 # MAIN
@@ -169,51 +184,46 @@ def analizza(storico, prodotto):
 
 def main():
     storico, sha = load_github()
-    oggi = str(datetime.date.today())
+    log = load_local(MSG_FILE)
 
+    oggi = str(datetime.date.today())
     prodotti = scrape()
 
-    if not prodotti:
-        print("No prodotti")
-        return
+    # HEARTBEAT
+    send_telegram(f"🤖 BOT ATTIVO\n📦 Prodotti: {len(prodotti)}", log)
 
     for p in prodotti:
         nome = p["nome"]
         prezzo = p["prezzo"]
         disponibile = p["disponibile"]
 
-        if nome not in storico:
-            storico[nome] = []
+        storico.setdefault(nome, [])
 
-        info = analizza(storico, p)
+        res = analizza(storico, nome, prezzo)
 
-        # salva sempre
         storico[nome].append({
             "prezzo": prezzo,
             "data": oggi,
             "disponibile": disponibile
         })
 
-        # ALERT PRO
-        if info:
-            if info["variazione"] < -5:  # calo forte
-                msg = f"""🔥 CALO PREZZO
+        if res:
+            variazione, roi, ultimo = res
 
-{nome}
-💰 {info['ultimo']}€ → {prezzo}€
-📉 {info['variazione']}€
-💸 ROI: {info['roi']}%
-📦 {'Disponibile' if disponibile else '❌ Esaurito'}
-"""
-                send_telegram(msg)
+            if variazione < -5:
+                send_telegram(
+                    f"🔥 CALO\n{nome}\n{ultimo}€ → {prezzo}€\nROI {roi}%",
+                    log
+                )
+
+        if not disponibile:
+            send_telegram(f"❌ ESAURITO:\n{nome}", log)
+
+    # PULIZIA 24H
+    log = delete_old_messages(log)
+    save_local(MSG_FILE, log)
 
     save_github(storico, sha)
-
-    print("FINE PRO")
-
-# ======================
-# RUN
-# ======================
 
 if __name__ == "__main__":
     main()
