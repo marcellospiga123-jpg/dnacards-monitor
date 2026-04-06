@@ -14,36 +14,33 @@
 <script>
 async function carica() {
     try {
-        const res = await fetch("https://raw.githubusercontent.com/marcellospiga123-jpg/dnacards-monitor/main/dati.json");
-        
-        if (!res.ok) {
-            alert("ERRORE fetch dati.json");
-            return;
-        }
+        const res = await fetch("https://raw.githubusercontent.com/marcellospiga123-jpg/dnacards-monitor/main/storico.json");
 
-        const dati = await res.json();
+        if (!res.ok) throw new Error("Errore fetch");
 
-        if (!dati.length) {
-            alert("Nessun dato!");
-            return;
-        }
+        const data = await res.json();
 
-        const labels = dati.map(d => new Date(d.timestamp).toLocaleTimeString());
-        const prezzi = dati.map(d => d.prezzo_medio);
+        const labels = data.map(d => d.timestamp);
+
+        const prezzi = data.map(d => {
+            const disponibili = d.prodotti.filter(p => p.disponibile);
+            return disponibili.length ? disponibili[0].prezzo : 0;
+        });
 
         new Chart(document.getElementById("grafico"), {
             type: "line",
             data: {
                 labels: labels,
                 datasets: [{
-                    label: "Prezzo medio",
+                    label: "Prezzo medio disponibile",
                     data: prezzi
                 }]
             }
         });
 
     } catch (e) {
-        alert("Errore JS: " + e);
+        alert("ERRORE fetch dati.json");
+        console.error(e);
     }
 }
 </script>
