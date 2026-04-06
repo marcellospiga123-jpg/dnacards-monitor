@@ -1,4 +1,4 @@
-name: Monitor
+name: DNA Monitor
 
 on:
   schedule:
@@ -10,17 +10,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Clona repo
+        uses: actions/checkout@v3
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install
-        run: pip install requests beautifulsoup4
+      - name: Installa dipendenze
+        run: pip install requests beautifulsoup4 python-telegram-bot
 
-      - name: Run bot
+      - name: Avvia bot
         run: python dnacards_monitor.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
