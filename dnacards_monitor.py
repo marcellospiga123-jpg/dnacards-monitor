@@ -1,158 +1,81 @@
 import requests
 from bs4 import BeautifulSoup
 import json
-import datetime
 import base64
 import os
-import time
+from datetime import datetime, timedelta
 
-# ======================
-# CONFIG
-# ======================
-
-GITHUB_TOKEN = os.getenv("GH_TOKEN")
-REPO = os.getenv("REPO")
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-FILE_NAME = "storico.json"
-MSG_FILE = "messages.json"
-HEARTBEAT_FILE = "heartbeat.json"
-
+# ===== CONFIG =====
 URLS = [
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-en/",
     "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept-Language": "it-IT,it;q=0.9"
-}
+GITHUB_TOKEN = os.getenv("GH_TOKEN")
+REPO = os.getenv("REPO")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ======================
-# TELEGRAM
-# ======================
+FILE_NAME = "storico.json"
+HEART_FILE = "heartbeat.json"
 
-def send_telegram(msg, log):
+# ===== TELEGRAM =====
+def send_telegram(msg):
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10
-        ).json()
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    except:
+        pass
 
-        print("TELEGRAM:", r)
-
-        if "result" in r:
-            log.append({
-                "id": r["result"]["message_id"],
-                "time": time.time()
-            })
-    except Exception as e:
-        print("Errore Telegram:", e)
-
-def delete_old_messages(log):
-    now = time.time()
-    nuovi = []
-
-    for m in log:
-        if now - m["time"] > 86400:
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "message_id": m["id"]
-                    }
-                )
-            except:
-                continue
-        else:
-            nuovi.append(m)
-
-    return nuovi
-
-# ======================
-# HEARTBEAT
-# ======================
-
+# ===== HEARTBEAT =====
 def load_heartbeat():
-    if os.path.exists(HEARTBEAT_FILE):
-        with open(HEARTBEAT_FILE) as f:
+    if os.path.exists(HEART_FILE):
+        with open(HEART_FILE) as f:
             return json.load(f)
-    return {"last": 0}
+    return {"last": "2000-01-01T00:00:00"}
 
 def save_heartbeat(data):
-    with open(HEARTBEAT_FILE, "w") as f:
+    with open(HEART_FILE, "w") as f:
         json.dump(data, f)
 
-def heartbeat(log, prodotti):
+def heartbeat(prodotti):
     hb = load_heartbeat()
-    now = time.time()
+    last = datetime.fromisoformat(hb["last"])
+    now = datetime.now()
 
-    if now - hb["last"] > 900:
-        send_telegram(f"🤖 BOT ATTIVO\nProdotti trovati: {len(prodotti)}", log)
-        hb["last"] = now
+    if now - last > timedelta(minutes=15):
+        send_telegram(f"🤖 BOT ATTIVO\nProdotti: {len(prodotti)}")
+        hb["last"] = now.isoformat()
         save_heartbeat(hb)
 
-# ======================
-# FILE LOCALI
-# ======================
-
-def load_local(file):
-    if os.path.exists(file):
-        with open(file) as f:
-            return json.load(f)
-    return []
-
-def save_local(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f, indent=2)
-
-# ======================
-# GITHUB (FIX 404)
-# ======================
-
-def load_github():
-    try:
-        url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-
-        r = requests.get(url, headers=headers, timeout=10)
-
-        print("LOAD GITHUB STATUS:", r.status_code)
-
-        if r.status_code == 200:
-            content = base64.b64decode(r.json()["content"]).decode()
-            return json.loads(content), r.json()["sha"]
-
-        elif r.status_code == 404:
-            print("⚠️ File non esiste → verrà creato")
-            return {}, None
-
-    except Exception as e:
-        print("Errore load GitHub:", e)
-
-    return {}, None
-
-
-def save_github(data, sha):
+# ===== GITHUB LOAD =====
+def load_from_github():
     url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
 
-    content = base64.b64encode(
-        json.dumps(data, indent=2).encode()
-    ).decode()
+    r = requests.get(url, headers=headers)
+
+    print("LOAD GITHUB:", r.status_code)
+
+    if r.status_code != 200:
+        return {}, None
+
+    data = r.json()
+    content = base64.b64decode(data["content"]).decode()
+
+    return json.loads(content), data["sha"]
+
+# ===== GITHUB SAVE =====
+def save_to_github(data, sha):
+    url = f"https://api.github.com/repos/{REPO}/contents/{FILE_NAME}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
+
+    content = base64.b64encode(json.dumps(data, indent=2).encode()).decode()
 
     payload = {
-        "message": "update prezzi automatico",
-        "content": content,
-        "branch": "main"
+        "message": "update storico",
+        "content": content
     }
 
     if sha:
@@ -161,48 +84,33 @@ def save_github(data, sha):
     r = requests.put(url, headers=headers, json=payload)
 
     print("GITHUB STATUS:", r.status_code)
-    print("GITHUB RESPONSE:", r.text)
 
-# ======================
-# SCRAPING (STABILE)
-# ======================
-
-def fetch(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        return r.text
-    except Exception as e:
-        print("Errore fetch:", e)
-        return None
-
+# ===== SCRAPER =====
 def scrape():
     prodotti = []
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     for url in URLS:
-        print("Scraping:", url)
+        try:
+            print("Scraping:", url)
+            r = requests.get(url, headers=headers, timeout=15)
+            soup = BeautifulSoup(r.text, "html.parser")
 
-        html = fetch(url)
-        if not html:
-            continue
+            for c in soup.select(".product"):
+                nome = c.select_one("h2").text.strip()
 
-        soup = BeautifulSoup(html, "html.parser")
-        items = soup.select("li.product")
+                prezzo = 0
+                prezzo_tag = c.select_one(".price")
 
-        print("Trovati:", len(items))
-
-        for item in items:
-            try:
-                nome = item.select_one("h2").text.strip()
-
-                prezzo_raw = item.select_one(".price").text
-                prezzo = float(
-                    prezzo_raw.replace("€", "")
-                    .replace(",", ".")
-                    .strip()
-                )
+                if prezzo_tag:
+                    txt = prezzo_tag.text.replace("€", "").replace(",", ".")
+                    try:
+                        prezzo = float(txt.split()[0])
+                    except:
+                        prezzo = 0
 
                 disponibile = True
-                if "esaurito" in item.text.lower():
+                if "esaurito" in c.text.lower():
                     disponibile = False
 
                 prodotti.append({
@@ -211,48 +119,85 @@ def scrape():
                     "disponibile": disponibile
                 })
 
-            except Exception as e:
-                print("Errore parsing:", e)
+        except Exception as e:
+            print("Errore scraping:", e)
 
-        time.sleep(2)
-
-    print("PRODOTTI TOTALI:", len(prodotti))
+    print("PRODOTTI:", len(prodotti))
     return prodotti
 
-# ======================
-# MAIN
-# ======================
+# ===== CLEAN =====
+def clean_old(data):
+    now = datetime.now()
 
+    for nome in list(data.keys()):
+        data[nome] = [
+            x for x in data[nome]
+            if datetime.fromisoformat(x["time"]) > now - timedelta(hours=24)
+        ]
+
+        if not data[nome]:
+            del data[nome]
+
+    return data
+
+# ===== MAIN =====
 def main():
-    storico, sha = load_github()
-    log = load_local(MSG_FILE)
+    storico, sha = load_from_github()
 
-    oggi = str(datetime.date.today())
+    if not isinstance(storico, dict):
+        storico = {}
+
     prodotti = scrape()
 
-    print("DEBUG PRODOTTI:", prodotti)
-
     if not prodotti:
-        print("⚠️ NESSUN PRODOTTO → STOP")
+        send_telegram("❌ ERRORE SCRAPING")
         return
 
-    heartbeat(log, prodotti)
+    heartbeat(prodotti)
 
     for p in prodotti:
         nome = p["nome"]
 
-        storico.setdefault(nome, [])
+        if nome not in storico:
+            storico[nome] = []
+
+        last = storico[nome][-1] if storico[nome] else None
+
+        # ===== ALERT =====
+        if last:
+            if p["prezzo"] != last["prezzo"]:
+                send_telegram(f"💰 PREZZO CAMBIATO\n{nome}\n{last['prezzo']}€ → {p['prezzo']}€")
+
+            if not last["disponibile"] and p["disponibile"]:
+                send_telegram(f"🔥 DISPONIBILE\n{nome}")
 
         storico[nome].append({
             "prezzo": p["prezzo"],
-            "data": oggi,
-            "disponibile": p["disponibile"]
+            "disponibile": p["disponibile"],
+            "time": datetime.now().isoformat()
         })
 
-    log = delete_old_messages(log)
-    save_local(MSG_FILE, log)
+        # ===== ROI =====
+        prezzi = [x["prezzo"] for x in storico[nome] if x["prezzo"] > 0]
 
-    save_github(storico, sha)
+        if len(prezzi) > 1:
+            attuale = prezzi[-1]
+            massimo = max(prezzi)
+            minimo = min(prezzi)
 
+            roi = ((massimo - attuale) / attuale * 100)
+
+            if roi > 20:
+                send_telegram(
+                    f"🚀 ROI ALTO\n{nome}\n"
+                    f"💰 {attuale}€\n"
+                    f"📈 {massimo}€\n"
+                    f"🔥 ROI {roi:.2f}%"
+                )
+
+    storico = clean_old(storico)
+    save_to_github(storico, sha)
+
+# ===== RUN =====
 if __name__ == "__main__":
     main()
