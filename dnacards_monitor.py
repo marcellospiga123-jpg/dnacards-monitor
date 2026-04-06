@@ -1,10 +1,14 @@
+
 import requests
 from bs4 import BeautifulSoup
-import time
 import os
+import json
+from datetime import datetime, timedelta
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+STORICO_FILE = "storico.json"
 
 URLS = [
     "https://dnacards.it/categoria/one-piece/display-buste-one-piece-jp/",
@@ -12,149 +16,127 @@ URLS = [
     "https://dnacards.it/categoria/one-piece/bustine-singole-one-piece-en/"
 ]
 
-storico = {}
-messaggi = []
-last_heartbeat = 0
-last_cleanup = time.time()
-
-# ---------------- TELEGRAM ---------------- #
-
+# ---------- TELEGRAM ----------
 def send(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, data={
-            "chat_id": CHAT_ID,
-            "text": msg
-        }, timeout=10)
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": msg}
+    )
 
-        if r.status_code == 200:
-            msg_id = r.json()["result"]["message_id"]
-            messaggi.append(msg_id)
+# ---------- LOAD/SAVE ----------
+def load_storico():
+    if not os.path.exists(STORICO_FILE):
+        return {}
+    with open(STORICO_FILE, "r") as f:
+        return json.load(f)
 
-    except Exception as e:
-        print("Errore invio telegram:", e)
+def save_storico(data):
+    with open(STORICO_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-def delete_all():
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
+# ---------- CLEAN OLD ----------
+def clean_old(storico):
+    now = datetime.now()
+    new_data = {}
 
-    for m in messaggi:
-        try:
-            requests.post(url, data={
-                "chat_id": CHAT_ID,
-                "message_id": m
-            }, timeout=5)
-        except:
-            pass
+    for k, v in storico.items():
+        t = datetime.fromisoformat(v["time"])
+        if now - t < timedelta(hours=24):
+            new_data[k] = v
 
-    messaggi.clear()
+    return new_data
 
-# ---------------- SCRAPER ---------------- #
-
+# ---------- SCRAPER ----------
 def scrape():
     prodotti = []
 
     for url in URLS:
-        try:
-            res = requests.get(url, timeout=10)
-            soup = BeautifulSoup(res.text, "html.parser")
+        res = requests.get(url)
+        soup = BeautifulSoup(res.text, "html.parser")
 
-            cards = soup.select(".product")
+        cards = soup.select(".product")
 
-            for c in cards:
-                nome = c.select_one("h2").text.strip()
+        for c in cards:
+            nome = c.select_one("h2").text.strip()
 
-                prezzo_tag = c.select_one(".price")
-                prezzo = 0
-
-                if prezzo_tag:
-                    prezzo = float(
-                        prezzo_tag.text
-                        .replace("€", "")
-                        .replace(",", ".")
-                        .strip()
-                    )
-
-                disponibile = "Esaurito" not in c.text
-
-                prodotti.append({
-                    "nome": nome,
-                    "prezzo": prezzo,
-                    "disponibile": disponibile
-                })
-
-        except Exception as e:
-            print("Errore scraping:", e)
-
-    print(f"PRODOTTI TROVATI: {len(prodotti)}")
-    return prodotti
-
-# ---------------- LOGICA ---------------- #
-
-def check(prodotti):
-    global storico
-
-    for p in prodotti:
-        nome = p["nome"]
-
-        if nome not in storico:
-            storico[nome] = p
-
-            send(f"🆕 NUOVO\n{nome}\n💰 {p['prezzo']}€")
-
-        else:
-            old = storico[nome]
-
-            # prezzo
-            if p["prezzo"] != old["prezzo"]:
-                diff = round(p["prezzo"] - old["prezzo"], 2)
-
-                send(
-                    f"💸 PREZZO CAMBIATO\n{nome}\n"
-                    f"{old['prezzo']}€ ➜ {p['prezzo']}€\n"
-                    f"ROI: {diff}€"
+            prezzo = 0
+            p = c.select_one(".price")
+            if p:
+                prezzo = float(
+                    p.text.replace("€", "").replace(",", ".").strip()
                 )
 
-            # disponibilità
-            if p["disponibile"] != old["disponibile"]:
-                stato = "🟢 DISPONIBILE" if p["disponibile"] else "🔴 ESAURITO"
-                send(f"{stato}\n{nome}")
+            disponibile = "Esaurito" not in c.text
 
-            storico[nome] = p
+            prodotti.append({
+                "nome": nome,
+                "prezzo": prezzo,
+                "disp": disponibile
+            })
 
-# ---------------- HEARTBEAT ---------------- #
+    return prodotti
 
-def heartbeat():
-    global last_heartbeat
+# ---------- ROI ----------
+def calcola_roi(prezzo):
+    target = 120  # puoi cambiare
+    return round(((target - prezzo) / prezzo) * 100, 2) if prezzo > 0 else 0
 
-    now = time.time()
-
-    if now - last_heartbeat > 900:
-        send("💓 BOT ATTIVO")
-        last_heartbeat = now
-
-# ---------------- MAIN ---------------- #
-
+# ---------- MAIN ----------
 def main():
-    global last_cleanup
+    print("🚀 BOT AVVIATO")
 
-    send("🚀 BOT AVVIATO")
+    storico = load_storico()
+    storico = clean_old(storico)
 
-    while True:
-        try:
-            prodotti = scrape()
-            check(prodotti)
-            heartbeat()
+    prodotti = scrape()
+    print(f"PRODOTTI: {len(prodotti)}")
 
-            # cleanup ogni 24h
-            if time.time() - last_cleanup > 86400:
-                delete_all()
-                last_cleanup = time.time()
-                send("🧹 Pulizia completata")
+    nuovi_alert = []
 
-        except Exception as e:
-            send(f"❌ ERRORE: {e}")
+    for p in prodotti:
+        key = p["nome"]
+        prezzo = p["prezzo"]
+        disp = p["disp"]
 
-        time.sleep(60)
+        old = storico.get(key)
+
+        changed = False
+
+        if not old:
+            changed = True
+        else:
+            if old["prezzo"] != prezzo or old["disp"] != disp:
+                changed = True
+
+        if changed:
+            roi = calcola_roi(prezzo)
+
+            msg = f"📦 {key}\n💰 {prezzo}€\n"
+
+            if disp:
+                msg += "✅ Disponibile\n"
+            else:
+                msg += "❌ Esaurito\n"
+
+            msg += f"📈 ROI: {roi}%"
+
+            nuovi_alert.append(msg)
+
+        storico[key] = {
+            "prezzo": prezzo,
+            "disp": disp,
+            "time": datetime.now().isoformat()
+        }
+
+    save_storico(storico)
+
+    # ---------- SEND ----------
+    if nuovi_alert:
+        send("🔥 NUOVI AGGIORNAMENTI 🔥")
+        for m in nuovi_alert[:10]:
+            send(m)
+
+    send(f"💓 BOT ATTIVO\nProdotti: {len(prodotti)}")
 
 if __name__ == "__main__":
     main()
